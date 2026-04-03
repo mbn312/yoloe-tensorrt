@@ -1,0 +1,95 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.13",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "yoloe-tensorrt"
+version = "0.1.0"
+description = "TensorRT runtime for Ultralytics YOLOE with runtime text and visual prompts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+  {name = "yoloe-tensorrt maintainers"},
+]
+maintainers = [
+  {name = "yoloe-tensorrt maintainers"},
+]
+keywords = ["yoloe", "tensorrt", "jetson", "cuda", "ultralytics", "computer-vision"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "numpy<2",
+  "torch>=2.3",
+  "ultralytics>=8.4.30",
+]
+
+[project.optional-dependencies]
+export = [
+  "onnx>=1.12,<2",
+]
+gui = [
+  "opencv-python>=4.8",
+  "Pillow>=10.0",
+]
+dev = [
+  "build>=1.2",
+  "onnx>=1.12,<2",
+  "opencv-python>=4.8",
+  "Pillow>=10.0",
+  "pytest>=8.0",
+  "ruff>=0.15.0",
+]
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+]
+
+[project.scripts]
+yoloe-camera-gui = "yoloe_tensorrt.gui:main"
+yoloe-export = "yoloe_tensorrt.export_cli:main"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["yoloe_tensorrt"]
+
+[tool.scikit-build.sdist]
+exclude = [
+  ".agents",
+  ".codex",
+  ".github",
+  "outputs",
+  "models",
+  "**/__pycache__",
+  ".pytest_cache",
+]
+
+[tool.pytest.ini_options]
+cache_dir = "outputs/pytest_cache"
+markers = [
+  "integration: slow export/runtime tests that require CUDA and TensorRT",
+  "gui: interactive tests that open a live GUI window",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["yoloe_tensorrt", "tests", "scripts"]
+extend-exclude = ["outputs", ".agents", ".codex"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

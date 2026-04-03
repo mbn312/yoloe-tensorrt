@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Verify release metadata for tag pushes
+        if: github.event_name == 'push'
+        run: python -m yoloe_tensorrt.release_metadata --expected-version "${{ github.ref_name }}"
+
+      - name: Verify release metadata for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        run: python -m yoloe_tensorrt.release_metadata
+
+      - name: Build source distribution
+        run: python -m build --sdist --outdir outputs/dist
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: outputs/dist/*
+          if-no-files-found: error

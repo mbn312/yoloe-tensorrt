@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    tags-ignore:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+      - run: python -m pip install --upgrade pip ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+      - run: python -m pip install --upgrade pip mkdocs mkdocs-material
+      - run: mkdocs build --strict
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ".[dev,export,gui]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
+      - run: python -m pytest -q tests/test_assets.py tests/test_cli.py tests/test_export.py tests/test_gui_helpers.py tests/test_logging.py tests/test_prompts.py tests/test_release_metadata.py tests/test_text_encoder_fallback.py
+
+  install-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ".[export,gui]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
+      - run: python -m yoloe_tensorrt --help
+      - run: python -m yoloe_tensorrt export --help
+      - run: yoloe-camera-gui --help
+      - run: yoloe-export --help
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements-dev.txt
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build --sdist --outdir outputs/dist

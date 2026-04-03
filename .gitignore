@@ -1,0 +1,17 @@
+outputs/*
+!outputs/README.md
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+site/
+/*.pt
+/*.onnx
+/*.engine
+/mobileclip*.ts
+/prompt_projector.ts

@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import onnx
+import pytest
+import torch
+import yoloe_tensorrt.export as export_mod
+from yoloe_tensorrt import export_model
+
+
+def test_export_model_creates_expected_onnx_artifacts(tmp_path: Path, model_checkpoint: Path) -> None:
+    artifact_dir = export_model(model_checkpoint, artifact_dir=tmp_path / "artifacts", formats=("onnx",), dynamic=True)
+
+    expected_files = {
+        "main.onnx",
+        "visual_prompt.onnx",
+        "prompt_projector.ts",
+        "metadata.json",
+    }
+    assert expected_files.issubset({path.name for path in artifact_dir.iterdir()})
+
+    metadata = json.loads((artifact_dir / "metadata.json").read_text())
+    assert metadata["task"] == "segment"
+    assert metadata["embed_dim"] == 512
+    assert metadata["visual_stride"] == 8
+
+    main_model = onnx.load(artifact_dir / "main.onnx")
+    main_inputs = [node.name for node in main_model.graph.input]
+    assert main_inputs == ["images", "prompt_embeddings"]
+
+    visual_model = onnx.load(artifact_dir / "visual_prompt.onnx")
+    visual_inputs = [node.name for node in visual_model.graph.input]
+    assert visual_inputs == ["images", "visual_prompts"]
+
+
+def test_export_model_resumes_partial_main_only_bundle_without_reexport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_checkpoint: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "main.onnx").write_text("existing-onnx")
+    (artifact_dir / "prompt_projector.ts").write_text("existing-projector")
+
+    class _DummyHead:
+        embed = 512
+        nm = 32
+        reprta = object()
+
+    class _DummyModel:
+        task = "segment"
+        end2end = False
+        stride = torch.tensor([8, 16, 32])
+        yaml = {"text_model": "mobileclip2:b"}
+        args = {"imgsz": 320}
+        model = [_DummyHead()]
+
+    monkeypatch.setattr(export_mod, "_load_yoloe_model", lambda _path: _DummyModel())
+    monkeypatch.setattr(export_mod, "_configure_export_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(export_mod, "_save_text_encoder_asset", lambda *args, **kwargs: "mobileclip2_b.ts")
+    monkeypatch.setattr(
+        export_mod,
+        "save_prompt_projector",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prompt projector should be reused")),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_export_onnx",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ONNX export should be reused")),
+    )
+
+    engine_builds: list[tuple[str, str]] = []
+
+    def _fake_build_engine(onnx_path: str | Path, engine_path: str | Path, **_kwargs) -> Path:
+        engine_builds.append((Path(onnx_path).name, Path(engine_path).name))
+        Path(engine_path).write_bytes(b"engine")
+        return Path(engine_path)
+
+    monkeypatch.setattr(export_mod, "build_engine_from_onnx", _fake_build_engine)
+
+    output_dir = export_model(
+        model_checkpoint,
+        artifact_dir=artifact_dir,
+        formats=("engine",),
+        dynamic=False,
+        build_visual_engine=False,
+        overwrite=False,
+    )
+
+    assert output_dir == artifact_dir
+    assert engine_builds == [("main.onnx", "main.engine")]
+
+    metadata = json.loads((artifact_dir / "metadata.json").read_text())
+    assert metadata["main_engine_filename"] == "main.engine"
+    assert metadata["visual_onnx_filename"] is None
+    assert metadata["visual_engine_filename"] is None
