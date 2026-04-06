@@ -35,10 +35,10 @@ On Jetson, these are typically supplied by JetPack and system packages. On x86_6
 Install from a public git repository:
 
 ```bash
-pip install "yoloe-tensorrt[export,gui] @ git+https://<repo-url>"
+pip install "yoloe-tensorrt[export,gui] @ git+https://github.com/mbn312/yoloe-tensorrt"
 ```
 
-Install from PyPI:
+Install from PyPI (Not Implemented Yet):
 
 ```bash
 pip install "yoloe-tensorrt[export,gui]"

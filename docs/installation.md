@@ -17,10 +17,10 @@ Install these before the Python package:
 ## Install from git
 
 ```bash
-pip install "yoloe-tensorrt[export,gui] @ git+https://<repo-url>"
+pip install "yoloe-tensorrt[export,gui] @ git+https://github.com/mbn312/yoloe-tensorrt"
 ```
 
-## Install from PyPI
+## Install from PyPI (Not Implemented Yet)
 
 ```bash
 pip install "yoloe-tensorrt[export,gui]"
