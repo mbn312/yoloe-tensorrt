@@ -47,25 +47,49 @@ else()
   message(STATUS "Found OpenCV via pkg-config: ${OPENCV_VERSION}")
 endif()
 
-find_path(
-  TENSORRT_INCLUDE_DIR
-  NvInfer.h
-  PATHS
-    /usr/include
-    /usr/include/aarch64-linux-gnu
-    /usr/include/x86_64-linux-gnu
-  REQUIRED
-)
-
 find_library(
   TENSORRT_LIBRARY
   nvinfer
-  PATHS
-    /usr/lib
-    /usr/lib/aarch64-linux-gnu
-    /usr/lib/x86_64-linux-gnu
+  HINTS
+    $ENV{TENSORRT_ROOT}
+    $ENV{TensorRT_ROOT}
+    /usr
+    /usr/local
+    /opt
+    /opt/TensorRT
+    /usr/src/tensorrt
+  PATH_SUFFIXES
+    lib
+    lib64
+    lib/${CMAKE_LIBRARY_ARCHITECTURE}
   REQUIRED
 )
+
+get_filename_component(TENSORRT_LIBRARY_DIR "${TENSORRT_LIBRARY}" DIRECTORY)
+get_filename_component(TENSORRT_LIBRARY_PREFIX "${TENSORRT_LIBRARY_DIR}" DIRECTORY)
+
+find_path(
+  TENSORRT_INCLUDE_DIR
+  NvInfer.h
+  HINTS
+    $ENV{TENSORRT_ROOT}
+    $ENV{TensorRT_ROOT}
+    "${TENSORRT_LIBRARY_DIR}"
+    "${TENSORRT_LIBRARY_PREFIX}"
+    /usr
+    /usr/local
+    /opt
+    /opt/TensorRT
+    /usr/src/tensorrt
+  PATH_SUFFIXES
+    include
+    include/${CMAKE_LIBRARY_ARCHITECTURE}
+    ${CMAKE_LIBRARY_ARCHITECTURE}
+  REQUIRED
+)
+
+message(STATUS "Found TensorRT include dir: ${TENSORRT_INCLUDE_DIR}")
+message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
 
 pybind11_add_module(_native MODULE src/native/main.cpp)
 

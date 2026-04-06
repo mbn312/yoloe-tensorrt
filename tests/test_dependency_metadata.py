@@ -21,10 +21,14 @@ def test_export_and_dev_dependencies_include_onnxscript() -> None:
 
     export_reqs = optional["export"]
     dev_reqs = optional["dev"]
+    all_reqs = optional["all"]
 
     assert any(req.startswith("onnx>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in dev_reqs)
+    assert any(req.startswith("onnxscript>=") for req in all_reqs)
+    assert "pytest>=8.0" in all_reqs
+    assert "mkdocs>=1.6" in all_reqs
 
 
 def test_requirements_files_include_clip_dependency() -> None:
@@ -34,3 +38,4 @@ def test_requirements_files_include_clip_dependency() -> None:
     clip_requirement = "git+https://github.com/ultralytics/CLIP.git"
     assert clip_requirement in requirements
     assert clip_requirement in requirements_dev
+    assert "-e .[all]" in requirements_dev

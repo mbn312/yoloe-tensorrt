@@ -1,2 +1,2 @@
--e .[dev,export,gui,docs]
+-e .[all]
 git+https://github.com/ultralytics/CLIP.git

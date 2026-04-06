@@ -20,7 +20,7 @@ The contributor requirements file also installs the current VCS-only Ultralytics
 If you do not have TensorRT headers/libs available and only need docs or lightweight unit tests, install with the native build disabled:
 
 ```bash
-python -m pip install ".[dev,export,gui,docs]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
+python -m pip install ".[all]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
 ```
 
 ## Repository Conventions

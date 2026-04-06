@@ -20,6 +20,12 @@ Install these before the Python package:
 pip install "yoloe-tensorrt[export,gui] @ git+https://github.com/mbn312/yoloe-tensorrt"
 ```
 
+To install the aggregate package-managed extras instead:
+
+```bash
+pip install "yoloe-tensorrt[all] @ git+https://github.com/mbn312/yoloe-tensorrt"
+```
+
 If you need runtime text-label prompting, also install:
 
 ```bash
@@ -69,4 +75,5 @@ That mode is not a production deployment mode. It exists for packaging, docs, an
 ## Python dependency notes
 
 - `onnxscript` is required for the export path on newer PyTorch ONNX exporters and is included in the export dependency set.
+- `all` is available as an aggregate extra for the package-managed optional dependency groups.
 - The Ultralytics CLIP tokenizer dependency is currently installed from `git+https://github.com/ultralytics/CLIP.git`, so source-checkout installs use `requirements.txt` / `requirements-dev.txt` and git/PyPI installs need the extra command above when you use runtime text labels.

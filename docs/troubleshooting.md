@@ -13,6 +13,7 @@ If editable installation fails during CMake configuration:
 
 - make sure `python -m pybind11 --cmakedir` works in the same environment you are using for `pip install`
 - if OpenCV is installed under `/usr/local`, make sure `pkg-config --cflags opencv4` works
+- if TensorRT is installed in a non-standard prefix, set `TENSORRT_ROOT=/path/to/TensorRT` before installing
 - if you are using `--no-build-isolation`, install the build backend into that environment first:
 
 ```bash
