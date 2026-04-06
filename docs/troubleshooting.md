@@ -9,6 +9,16 @@ Check that these are installed and discoverable:
 - OpenCV headers/libs
 - `pybind11`, `scikit-build-core`, and CMake
 
+If editable installation fails during CMake configuration:
+
+- make sure `python -m pybind11 --cmakedir` works in the same environment you are using for `pip install`
+- if OpenCV is installed under `/usr/local`, make sure `pkg-config --cflags opencv4` works
+- if you are using `--no-build-isolation`, install the build backend into that environment first:
+
+```bash
+python -m pip install scikit-build-core pybind11 cmake ninja
+```
+
 ## Runtime falls back to Python
 
 Set:
