@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -190,15 +191,22 @@ def _export_onnx(
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Exporting ONNX graph to '%s'", path)
-    torch.onnx.export(
-        module,
-        args,
-        str(path),
-        opset_version=17,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes or None,
-    )
+    export_kwargs = {
+        "opset_version": 17,
+        "input_names": input_names,
+        "output_names": output_names,
+        "dynamic_axes": dynamic_axes or None,
+    }
+    try:
+        export_signature = inspect.signature(torch.onnx.export)
+    except (TypeError, ValueError):  # pragma: no cover - depends on torch runtime internals
+        export_signature = None
+    if export_signature is not None and "dynamo" in export_signature.parameters:
+        # Newer torch.onnx defaults to the torch.export/dynamo-based exporter, but the Ultralytics YOLOE
+        # graph mutates attributes during tracing and still exports more reliably through the legacy path.
+        export_kwargs["dynamo"] = False
+        LOGGER.info("Using legacy torch.onnx exporter path (dynamo=False) for YOLOE ONNX export compatibility")
+    torch.onnx.export(module, args, str(path), **export_kwargs)
     return path
 
 

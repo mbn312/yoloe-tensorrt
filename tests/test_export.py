@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -97,3 +98,36 @@ def test_export_model_resumes_partial_main_only_bundle_without_reexport(
     assert metadata["main_engine_filename"] == "main.engine"
     assert metadata["visual_onnx_filename"] is None
     assert metadata["visual_engine_filename"] is None
+
+
+def test_export_onnx_disables_dynamo_when_supported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_export(*args, **kwargs) -> None:
+        captured.update(kwargs)
+        Path(args[2]).write_bytes(b"onnx")
+
+    params = [
+        inspect.Parameter("model", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("args", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("f", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter("dynamo", inspect.Parameter.KEYWORD_ONLY, default=True),
+    ]
+    fake_signature = inspect.Signature(parameters=params)
+
+    monkeypatch.setattr(export_mod.torch.onnx, "export", _fake_export)
+    monkeypatch.setattr(export_mod.inspect, "signature", lambda _obj: fake_signature)
+
+    output_path = tmp_path / "main.onnx"
+    export_mod._export_onnx(
+        torch.nn.Identity(),
+        (torch.randn(1, 3, 32, 32),),
+        output_path,
+        input_names=["images"],
+        output_names=["output0"],
+        dynamic_axes={"images": {0: "batch"}},
+    )
+
+    assert output_path.is_file()
+    assert captured["dynamo"] is False
+    assert captured["dynamic_axes"] == {"images": {0: "batch"}}
