@@ -15,6 +15,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 ```
 
+The contributor requirements file also installs the current VCS-only Ultralytics CLIP dependency used by runtime text prompting.
+
 If you do not have TensorRT headers/libs available and only need docs or lightweight unit tests, install with the native build disabled:
 
 ```bash

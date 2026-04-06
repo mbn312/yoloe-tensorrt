@@ -39,6 +39,7 @@ dependencies = [
 [project.optional-dependencies]
 export = [
   "onnx>=1.12,<2",
+  "onnxscript>=0.1,<1",
 ]
 gui = [
   "opencv-python>=4.8",
@@ -47,6 +48,7 @@ gui = [
 dev = [
   "build>=1.2",
   "onnx>=1.12,<2",
+  "onnxscript>=0.1,<1",
   "opencv-python>=4.8",
   "Pillow>=10.0",
   "pytest>=8.0",

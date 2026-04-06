@@ -11,6 +11,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 ```
 
+`requirements-dev.txt` includes the repo's editable install plus the current VCS-only Ultralytics CLIP dependency that runtime text prompting needs.
+
 ## Native install notes
 
 The editable install above is the normal contributor path. If you only need docs or lightweight checks and do not have TensorRT headers/libs available:

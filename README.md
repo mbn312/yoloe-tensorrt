@@ -38,10 +38,31 @@ Install from a public git repository:
 pip install "yoloe-tensorrt[export,gui] @ git+https://github.com/mbn312/yoloe-tensorrt"
 ```
 
+If you need runtime text-label prompting, also install the CLIP tokenizer dependency that Ultralytics expects:
+
+```bash
+pip install git+https://github.com/ultralytics/CLIP.git
+```
+
 Install from PyPI (Not Implemented Yet):
 
 ```bash
 pip install "yoloe-tensorrt[export,gui]"
+```
+
+If you need runtime text-label prompting from a PyPI install, also install:
+
+```bash
+pip install git+https://github.com/ultralytics/CLIP.git
+```
+
+Install from a local checkout:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 Install from a local checkout for development:
@@ -56,6 +77,8 @@ python -m pip install -r requirements-dev.txt
 Notes:
 
 - `tensorrt` and system OpenCV are intentionally not hard-pinned as mandatory pip dependencies because Jetson environments commonly provide them outside pip.
+- `onnxscript` is part of the export dependency set because newer PyTorch ONNX export flows require it.
+- The CLIP tokenizer dependency is currently distributed as a VCS install, so it is listed in `requirements.txt` and `requirements-dev.txt` and shown explicitly above for git and PyPI installs.
 - The native extension builds by default during installation. For docs-only or unsupported environments, you can skip it with:
 
 ```bash
