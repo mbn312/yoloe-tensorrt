@@ -27,6 +27,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-fp16", action="store_true", help="Disable FP16 TensorRT builds.")
     parser.add_argument("--max-det", type=int, default=300, help="Maximum detections baked into export metadata.")
     parser.add_argument("--workspace-mb", type=int, default=2048, help="TensorRT builder workspace in MiB.")
+    parser.add_argument(
+        "--exporter",
+        choices=("auto", "legacy", "dynamo"),
+        default="auto",
+        help="ONNX exporter backend. 'auto' tries dynamo first on newer torch and falls back to legacy.",
+    )
+    parser.add_argument(
+        "--opset-version",
+        type=int,
+        help="Override the ONNX opset version. Defaults to 18 for dynamo and 17 for legacy.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing artifacts instead of resuming.")
     parser.add_argument("--log-level", default="INFO", help="Logging level for the export command.")
     return parser
@@ -49,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         max_det=int(args.max_det),
         overwrite=bool(args.overwrite),
         workspace_bytes=int(args.workspace_mb) << 20,
+        onnx_exporter=str(args.exporter),
+        onnx_opset_version=None if args.opset_version is None else int(args.opset_version),
     )
     print(artifact_dir)
     return 0

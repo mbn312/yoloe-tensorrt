@@ -4,7 +4,7 @@ import gc
 import inspect
 import shutil
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,9 @@ MAIN_ENGINE_FILENAME = "main.engine"
 VISUAL_ONNX_FILENAME = "visual_prompt.onnx"
 VISUAL_ENGINE_FILENAME = "visual_prompt.engine"
 PROMPT_PROJECTOR_FILENAME = "prompt_projector.ts"
+LEGACY_ONNX_OPSET = 17
+DYNAMO_ONNX_OPSET = 18
+OnnxExporterMode = Literal["auto", "legacy", "dynamo"]
 
 LOGGER = get_logger(__name__)
 
@@ -180,6 +183,99 @@ def _make_visual_profile(
     )
 
 
+def _torch_onnx_export_signature() -> inspect.Signature | None:
+    try:
+        return inspect.signature(torch.onnx.export)
+    except (TypeError, ValueError):  # pragma: no cover - depends on torch runtime internals
+        return None
+
+
+def _torch_onnx_supports(option: str) -> bool:
+    signature = _torch_onnx_export_signature()
+    return signature is not None and option in signature.parameters
+
+
+def _make_dynamo_dynamic_shapes(
+    args: tuple[torch.Tensor, ...],
+    input_names: list[str],
+    dynamic_axes: dict[str, dict[int, str]],
+) -> tuple[dict[int, object] | None, ...] | None:
+    if not dynamic_axes:
+        return None
+
+    export_namespace = getattr(torch, "export", None)
+    dim_factory = getattr(export_namespace, "Dim", None)
+    if dim_factory is None:
+        raise RuntimeError("The installed torch build does not expose torch.export.Dim for dynamo ONNX export")
+    if len(args) != len(input_names):
+        raise ValueError(f"Expected {len(input_names)} input name(s), got {len(args)} input tensor(s)")
+
+    symbolic_dims: dict[str, object] = {}
+    shapes: list[dict[int, object] | None] = []
+    for tensor, name in zip(args, input_names):
+        spec = dynamic_axes.get(name, {})
+        if not spec:
+            shapes.append(None)
+            continue
+        tensor_spec: dict[int, object] = {}
+        for dim, dim_name in spec.items():
+            if dim < 0 or dim >= tensor.ndim:
+                raise ValueError(
+                    f"Dynamic axis {dim} is out of range for input '{name}' with shape {tuple(tensor.shape)}"
+                )
+            tensor_spec[int(dim)] = symbolic_dims.setdefault(dim_name, dim_factory(dim_name))
+        shapes.append(tensor_spec or None)
+    return tuple(shapes)
+
+
+def _export_onnx_legacy(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    output_path: str | Path,
+    input_names: list[str],
+    output_names: list[str],
+    dynamic_axes: dict[str, dict[int, str]],
+    opset_version: int,
+) -> None:
+    LOGGER.info("Using legacy torch.onnx exporter path (opset=%d)", opset_version)
+    torch.onnx.export(
+        module,
+        args,
+        str(output_path),
+        opset_version=opset_version,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes or None,
+    )
+
+
+def _export_onnx_dynamo(
+    module: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    output_path: str | Path,
+    input_names: list[str],
+    output_names: list[str],
+    dynamic_axes: dict[str, dict[int, str]],
+    opset_version: int,
+) -> None:
+    if not _torch_onnx_supports("dynamo"):
+        raise RuntimeError("The installed torch build does not support the dynamo ONNX exporter")
+
+    export_kwargs = {
+        "opset_version": opset_version,
+        "input_names": input_names,
+        "output_names": output_names,
+        "dynamo": True,
+    }
+    if dynamic_axes:
+        if not _torch_onnx_supports("dynamic_shapes"):
+            raise RuntimeError("The installed torch build does not support dynamic_shapes for dynamo ONNX export")
+        export_kwargs["dynamic_shapes"] = _make_dynamo_dynamic_shapes(args, input_names, dynamic_axes)
+
+    LOGGER.info("Using dynamo torch.onnx exporter path (opset=%d)", opset_version)
+    torch.onnx.export(module, args, str(output_path), **export_kwargs)
+
+
 def _export_onnx(
     module: nn.Module,
     args: tuple[torch.Tensor, ...],
@@ -187,26 +283,77 @@ def _export_onnx(
     input_names: list[str],
     output_names: list[str],
     dynamic_axes: dict[str, dict[int, str]],
+    exporter: OnnxExporterMode = "auto",
+    opset_version: int | None = None,
 ) -> Path:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Exporting ONNX graph to '%s'", path)
-    export_kwargs = {
-        "opset_version": 17,
-        "input_names": input_names,
-        "output_names": output_names,
-        "dynamic_axes": dynamic_axes or None,
-    }
-    try:
-        export_signature = inspect.signature(torch.onnx.export)
-    except (TypeError, ValueError):  # pragma: no cover - depends on torch runtime internals
-        export_signature = None
-    if export_signature is not None and "dynamo" in export_signature.parameters:
-        # Newer torch.onnx defaults to the torch.export/dynamo-based exporter, but the Ultralytics YOLOE
-        # graph mutates attributes during tracing and still exports more reliably through the legacy path.
-        export_kwargs["dynamo"] = False
-        LOGGER.info("Using legacy torch.onnx exporter path (dynamo=False) for YOLOE ONNX export compatibility")
-    torch.onnx.export(module, args, str(path), **export_kwargs)
+    if exporter not in {"auto", "legacy", "dynamo"}:
+        raise ValueError(f"Unsupported ONNX exporter mode '{exporter}'")
+
+    if path.exists():
+        path.unlink()
+
+    def _cleanup_partial() -> None:
+        if path.exists():
+            path.unlink()
+
+    if exporter == "legacy":
+        _export_onnx_legacy(
+            module,
+            args,
+            path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=int(opset_version or LEGACY_ONNX_OPSET),
+        )
+        return path
+
+    if exporter == "dynamo":
+        try:
+            _export_onnx_dynamo(
+                module,
+                args,
+                path,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=int(opset_version or DYNAMO_ONNX_OPSET),
+            )
+        except Exception as exc:
+            _cleanup_partial()
+            raise RuntimeError(
+                "Dynamo ONNX export failed. Retry with exporter='legacy' or exporter='auto'."
+            ) from exc
+        return path
+
+    if _torch_onnx_supports("dynamo"):
+        try:
+            _export_onnx_dynamo(
+                module,
+                args,
+                path,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=int(opset_version or DYNAMO_ONNX_OPSET),
+            )
+            return path
+        except Exception as exc:
+            _cleanup_partial()
+            LOGGER.warning("Dynamo ONNX export failed, falling back to legacy exporter: %s", exc)
+
+    _export_onnx_legacy(
+        module,
+        args,
+        path,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        opset_version=int(opset_version or LEGACY_ONNX_OPSET),
+    )
     return path
 
 
@@ -221,6 +368,8 @@ def export_model(
     max_det: int = 300,
     overwrite: bool = True,
     workspace_bytes: int = 2 << 30,
+    onnx_exporter: OnnxExporterMode = "auto",
+    onnx_opset_version: int | None = None,
 ) -> Path:
     model_path = _resolved_model_path(pt_path)
     artifact_root = Path(artifact_dir) if artifact_dir is not None else default_artifact_dir(model_path)
@@ -232,13 +381,16 @@ def export_model(
     visual_engine_path = artifact_root / VISUAL_ENGINE_FILENAME
     projector_path = artifact_root / PROMPT_PROJECTOR_FILENAME
     LOGGER.info(
-        "Starting export for '%s' -> '%s' (formats=%s, dynamic=%s, fp16=%s, build_visual_engine=%s)",
+        "Starting export for '%s' -> '%s' (formats=%s, dynamic=%s, fp16=%s, build_visual_engine=%s, "
+        "onnx_exporter=%s, onnx_opset_version=%s)",
         model_path,
         artifact_root,
         tuple(requested_formats),
         dynamic,
         fp16,
         build_visual_engine,
+        onnx_exporter,
+        onnx_opset_version if onnx_opset_version is not None else "default",
     )
 
     if overwrite:
@@ -313,6 +465,8 @@ def export_model(
             input_names=[IMAGE_INPUT_NAME, PROMPT_INPUT_NAME],
             output_names=main_output_names,
             dynamic_axes=main_dynamic_axes,
+            exporter=onnx_exporter,
+            opset_version=onnx_opset_version,
         )
     else:
         LOGGER.info("Reusing existing main ONNX graph at '%s'", main_onnx_path)
@@ -342,6 +496,8 @@ def export_model(
                         "prompt_embeddings": {0: "batch", 1: "num_prompts"},
                     }
                 ),
+                exporter=onnx_exporter,
+                opset_version=onnx_opset_version,
             )
             LOGGER.info("Exported visual prompt ONNX graph to '%s'", visual_onnx_path)
         else:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 from pathlib import Path
 
@@ -100,23 +99,23 @@ def test_export_model_resumes_partial_main_only_bundle_without_reexport(
     assert metadata["visual_engine_filename"] is None
 
 
-def test_export_onnx_disables_dynamo_when_supported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    captured: dict[str, object] = {}
+def test_export_onnx_auto_falls_back_to_legacy_when_dynamo_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
 
-    def _fake_export(*args, **kwargs) -> None:
-        captured.update(kwargs)
+    def _fake_dynamo(*args, **kwargs) -> None:
+        calls.append("dynamo")
+        raise RuntimeError("boom")
+
+    def _fake_legacy(*args, **kwargs) -> None:
+        calls.append("legacy")
         Path(args[2]).write_bytes(b"onnx")
 
-    params = [
-        inspect.Parameter("model", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        inspect.Parameter("args", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        inspect.Parameter("f", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        inspect.Parameter("dynamo", inspect.Parameter.KEYWORD_ONLY, default=True),
-    ]
-    fake_signature = inspect.Signature(parameters=params)
-
-    monkeypatch.setattr(export_mod.torch.onnx, "export", _fake_export)
-    monkeypatch.setattr(export_mod.inspect, "signature", lambda _obj: fake_signature)
+    monkeypatch.setattr(export_mod, "_torch_onnx_supports", lambda option: option == "dynamo")
+    monkeypatch.setattr(export_mod, "_export_onnx_dynamo", _fake_dynamo)
+    monkeypatch.setattr(export_mod, "_export_onnx_legacy", _fake_legacy)
 
     output_path = tmp_path / "main.onnx"
     export_mod._export_onnx(
@@ -126,8 +125,73 @@ def test_export_onnx_disables_dynamo_when_supported(monkeypatch: pytest.MonkeyPa
         input_names=["images"],
         output_names=["output0"],
         dynamic_axes={"images": {0: "batch"}},
+        exporter="auto",
     )
 
     assert output_path.is_file()
-    assert captured["dynamo"] is False
-    assert captured["dynamic_axes"] == {"images": {0: "batch"}}
+    assert calls == ["dynamo", "legacy"]
+
+
+def test_export_onnx_dynamo_mode_uses_dynamic_shapes_and_opset_18(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_export(*args, **kwargs) -> None:
+        captured.update(kwargs)
+        Path(args[2]).write_bytes(b"onnx")
+
+    monkeypatch.setattr(export_mod.torch.onnx, "export", _fake_export)
+    monkeypatch.setattr(export_mod, "_torch_onnx_supports", lambda option: option in {"dynamo", "dynamic_shapes"})
+    monkeypatch.setattr(
+        export_mod.torch,
+        "export",
+        type("_ExportNS", (), {"Dim": staticmethod(lambda name: f"Dim({name})")}),
+    )
+
+    output_path = tmp_path / "main.onnx"
+    export_mod._export_onnx(
+        torch.nn.Identity(),
+        (torch.randn(1, 3, 32, 32), torch.randn(1, 80, 512)),
+        output_path,
+        input_names=["images", "prompt_embeddings"],
+        output_names=["output0"],
+        dynamic_axes={
+            "images": {0: "batch", 2: "height", 3: "width"},
+            "prompt_embeddings": {0: "batch", 1: "num_prompts"},
+        },
+        exporter="dynamo",
+    )
+
+    assert output_path.is_file()
+    assert captured["dynamo"] is True
+    assert captured["opset_version"] == 18
+    assert "dynamic_axes" not in captured
+    assert captured["dynamic_shapes"] == (
+        {0: "Dim(batch)", 2: "Dim(height)", 3: "Dim(width)"},
+        {0: "Dim(batch)", 1: "Dim(num_prompts)"},
+    )
+
+
+def test_export_onnx_dynamo_mode_raises_helpful_error_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def _fake_export(*args, **kwargs) -> None:
+        raise RuntimeError("bad dynamo export")
+
+    monkeypatch.setattr(export_mod.torch.onnx, "export", _fake_export)
+    monkeypatch.setattr(export_mod, "_torch_onnx_supports", lambda option: option in {"dynamo", "dynamic_shapes"})
+    monkeypatch.setattr(export_mod.torch, "export", type("_ExportNS", (), {"Dim": staticmethod(lambda name: name)}))
+
+    with pytest.raises(RuntimeError, match="Retry with exporter='legacy' or exporter='auto'"):
+        export_mod._export_onnx(
+            torch.nn.Identity(),
+            (torch.randn(1, 3, 32, 32),),
+            tmp_path / "main.onnx",
+            input_names=["images"],
+            output_names=["output0"],
+            dynamic_axes={"images": {0: "batch"}},
+            exporter="dynamo",
+        )

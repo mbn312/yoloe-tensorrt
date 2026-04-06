@@ -93,6 +93,12 @@ Export a bundle:
 yoloe-export yoloe-26s-seg.pt --artifact-dir outputs/artifacts/yoloe26s --fixed --imgsz 640
 ```
 
+On newer PyTorch builds, the default ONNX exporter mode is `auto`: it tries the newer dynamo exporter first and falls back to the legacy exporter if YOLOE tracing is incompatible. To force the stable legacy path explicitly:
+
+```bash
+yoloe-export yoloe-26s-seg.pt --artifact-dir outputs/artifacts/yoloe26s --exporter legacy
+```
+
 Run inference with runtime labels:
 
 ```python
