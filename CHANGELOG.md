@@ -13,3 +13,11 @@
 ## 0.1.0
 
 - Initial package release.
+
+## 0.1.1
+
+- Added in missing dependencies and setup information
+- Added auto/legacy/dynamo ONNX export modes for better suppport across PyTorch versions
+- Fixed some bugs with the native build config in CMakeList.txt
+- Added `all` option for building with extras
+- Updated native backend builds to be compatible with newer TensorRT versions
