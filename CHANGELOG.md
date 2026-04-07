@@ -21,3 +21,7 @@
 - Fixed some bugs with the native build config in CMakeList.txt
 - Added `all` option for building with extras
 - Updated native backend builds to be compatible with newer TensorRT versions
+
+## 0.1.2
+
+- Set logging level of YOLOE inference messages to debug

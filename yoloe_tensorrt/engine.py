@@ -371,7 +371,7 @@ class YOLOEEngine:
         retina_masks: bool,
     ) -> Results:
         prompt_embeddings, names = self._active_prompt_embeddings()
-        LOGGER.info(
+        LOGGER.debug(
             "Running inference on '%s' with %d active prompt class(es) at imgsz=%s",
             item.path,
             len(names),
@@ -424,7 +424,7 @@ class YOLOEEngine:
         speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
         result.speed = speed
         detections = int(result.boxes.data.shape[0]) if result.boxes is not None else 0
-        LOGGER.info(
+        LOGGER.debug(
             "Completed inference on '%s': detections=%d preprocess=%.1fms inference=%.1fms postprocess=%.1fms",
             item.path,
             detections,
@@ -487,7 +487,7 @@ class YOLOEEngine:
         resolved_max_det = int(max_det or self.metadata.max_det)
         if is_live_source(source) and not stream and not is_finite_live_source(source):
             raise ValueError("Live sources require stream=True or an explicit max_frames limit")
-        LOGGER.info(
+        LOGGER.debug(
             "Starting predict(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d)",
             stream,
             target_size,
