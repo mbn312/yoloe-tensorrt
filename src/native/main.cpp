@@ -47,7 +47,7 @@ struct TrtDeleter {
     void operator()(T* ptr) const
     {
         if (ptr != nullptr) {
-            ptr->destroy();
+            delete ptr;
         }
     }
 };
@@ -309,8 +309,13 @@ public:
         fp16_ = image_binding_.dtype == nvinfer1::DataType::kHALF;
         prompt_embed_dim_ = prompt_binding_.dims.nbDims >= 3 ? prompt_binding_.dims.d[2] : 0;
 
-        if (engine_->getNbOptimizationProfiles() > 0) {
-            context_->setOptimizationProfile(0);
+        if (engine_->getNbOptimizationProfiles() > 0 && context_->getOptimizationProfile() != 0) {
+            if (!context_->setOptimizationProfileAsync(0, stream_)) {
+                throw std::runtime_error("Failed to select TensorRT optimization profile 0");
+            }
+            throw_if_cuda_failed(
+                cudaStreamSynchronize(stream_),
+                "cudaStreamSynchronize failed after selecting optimization profile");
         }
     }
 
@@ -466,7 +471,7 @@ private:
 
     void discover_bindings()
     {
-        auto const count = engine_->getNbBindings();
+        auto const count = engine_->getNbIOTensors();
         bindings_.reserve(static_cast<std::size_t>(count));
         output_indices_.clear();
         output_names_.clear();
@@ -474,10 +479,10 @@ private:
         for (int i = 0; i < count; ++i) {
             BindingInfo binding;
             binding.index = i;
-            binding.name = engine_->getBindingName(i);
-            binding.is_input = engine_->bindingIsInput(i);
-            binding.dtype = engine_->getBindingDataType(i);
-            binding.dims = engine_->getBindingDimensions(i);
+            binding.name = engine_->getIOTensorName(i);
+            binding.is_input = engine_->getTensorIOMode(binding.name.c_str()) == nvinfer1::TensorIOMode::kINPUT;
+            binding.dtype = engine_->getTensorDataType(binding.name.c_str());
+            binding.dims = engine_->getTensorShape(binding.name.c_str());
             if (!binding.is_input) {
                 output_indices_.push_back(i);
                 output_names_.push_back(binding.name);
@@ -563,8 +568,8 @@ private:
             image_dims.d[0] = 1;
             image_dims.d[2] = target_h;
             image_dims.d[3] = target_w;
-            if (!context_->setBindingDimensions(image_input_index_, image_dims)) {
-                throw std::runtime_error("Failed to set dynamic image binding dimensions");
+            if (!context_->setInputShape(image_binding_.name.c_str(), image_dims)) {
+                throw std::runtime_error("Failed to set dynamic image tensor shape");
             }
         }
 
@@ -572,13 +577,13 @@ private:
         if (dims_has_dynamic(prompt_dims)) {
             prompt_dims.d[0] = 1;
             prompt_dims.d[1] = prompt_count;
-            if (!context_->setBindingDimensions(prompt_input_index_, prompt_dims)) {
-                throw std::runtime_error("Failed to set dynamic prompt binding dimensions");
+            if (!context_->setInputShape(prompt_binding_.name.c_str(), prompt_dims)) {
+                throw std::runtime_error("Failed to set dynamic prompt tensor shape");
             }
         }
 
-        if (!context_->allInputDimensionsSpecified()) {
-            throw std::runtime_error("TensorRT input dimensions are not fully specified");
+        if (context_->inferShapes(0, nullptr) != 0) {
+            throw std::runtime_error("TensorRT shape inference failed after setting input shapes");
         }
     }
 
@@ -586,8 +591,11 @@ private:
     {
         for (std::size_t i = 0; i < output_indices_.size(); ++i) {
             auto const binding_index = output_indices_[i];
-            auto const dims = context_->getBindingDimensions(binding_index);
             auto const& binding = bindings_[binding_index];
+            auto const dims = context_->getTensorShape(binding.name.c_str());
+            if (dims.nbDims < 0 || dims_has_dynamic(dims)) {
+                throw std::runtime_error("TensorRT reported unresolved output shape for tensor: " + binding.name);
+            }
             auto const bytes = element_count(dims) * dtype_size(binding.dtype);
             output_buffers_[i].ensure(bytes);
             output_shapes_[i] = dims_to_shape(dims);
@@ -602,15 +610,22 @@ private:
         set_input_dimensions(target_h, target_w, prompt_count);
         ensure_output_buffers();
 
-        std::vector<void*> bindings(static_cast<std::size_t>(engine_->getNbBindings()), nullptr);
-        bindings[static_cast<std::size_t>(image_input_index_)] = image_ptr;
-        bindings[static_cast<std::size_t>(prompt_input_index_)] = prompt_ptr;
+        if (!context_->setInputTensorAddress(image_binding_.name.c_str(), image_ptr)) {
+            throw std::runtime_error("Failed to bind TensorRT image input tensor");
+        }
+        if (!context_->setInputTensorAddress(prompt_binding_.name.c_str(), prompt_ptr)) {
+            throw std::runtime_error("Failed to bind TensorRT prompt input tensor");
+        }
         for (std::size_t i = 0; i < output_indices_.size(); ++i) {
-            bindings[static_cast<std::size_t>(output_indices_[i])] = output_buffers_[i].data();
+            auto const binding_index = output_indices_[i];
+            auto const& binding = bindings_[binding_index];
+            if (!context_->setTensorAddress(binding.name.c_str(), output_buffers_[i].data())) {
+                throw std::runtime_error("Failed to bind TensorRT output tensor: " + binding.name);
+            }
         }
 
-        if (!context_->enqueueV2(bindings.data(), stream_, nullptr)) {
-            throw std::runtime_error("TensorRT enqueueV2 failed");
+        if (!context_->enqueueV3(stream_)) {
+            throw std::runtime_error("TensorRT enqueueV3 failed");
         }
         throw_if_cuda_failed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed after inference");
     }
