@@ -165,6 +165,12 @@ Launch the GUI against a synthetic GStreamer source when no camera is attached:
 yoloe-camera-gui --source videotest://ball
 ```
 
+Launch the GUI against an RTSP stream:
+
+```bash
+yoloe-camera-gui --source rtsp://user:pass@camera.local:554/stream
+```
+
 Repo-local convenience launcher:
 
 ```bash
@@ -203,6 +209,7 @@ GitHub Actions is the supported automation path for this repository.
 - Plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors are still accepted without requiring manual preprocessing.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
 - Live USB camera input is available through a GStreamer appsink pipeline. Jetson zero-copy camera ingest is still on the roadmap.
+- Direct RTSP URLs such as `rtsp://camera.local/stream` are supported and resolved to a GStreamer RTSP pipeline automatically.
 - If you do not have a camera attached, use `videotest://<pattern>` such as `videotest://ball` or `videotest://smpte`.
 
 ## Repository Layout

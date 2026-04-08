@@ -42,8 +42,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=DEFAULT_CAMERA_SOURCE,
         help="Camera source for live GUI/integration tests. "
         "Defaults to /dev/video0 when present, otherwise videotest://ball. "
-        "Device paths are wrapped in a USB-camera GStreamer pipeline; raw GStreamer pipelines and dummy aliases "
-        "like videotest://ball are also accepted.",
+        "Device paths are wrapped in a USB-camera GStreamer pipeline; RTSP URLs, raw GStreamer pipelines, and "
+        "dummy aliases like videotest://ball are also accepted.",
     )
     group.addoption(
         "--camera-labels",

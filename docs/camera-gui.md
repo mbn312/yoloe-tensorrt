@@ -31,6 +31,7 @@ track IDs when detections are matched across frames.
 ## Source handling
 
 - `/dev/video*` device paths are wrapped in the package's GStreamer USB camera pipeline
+- `rtsp://...` and `rtsps://...` URLs are wrapped in a package-managed GStreamer RTSP pipeline
 - raw GStreamer pipeline strings are also accepted
 - `videotest://<pattern>` creates a synthetic GStreamer source, for example `videotest://ball` or `videotest://smpte`
 

@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
-
 ## 0.2.0
+
+## Unreleased
 
 - Unified `predict(...)` and `track(...)` around a single broad input surface with specialized internal routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
 - Added `PreparedTensorInput`, a prepared CUDA-tensor fast path, and a `benchmark` CLI for comparing host-image and CUDA-tensor inference through the native TensorRT runtime.
@@ -10,6 +10,7 @@
 - Fixed prepared-tensor correctness issues around integer dtype validation, CUDA producer-stream handoff, and cross-stream prepared-tensor inference.
 - Fixed unit-range float preprocessing so non-square padded inputs keep the correct scale instead of being divided by `255` a second time.
 - Expanded runtime and unit coverage for unified routing, benchmark CLI help, tracker-session input handling, and prepared-tensor regressions.
+- Added first-class RTSP input support so plain `rtsp://...` and `rtsps://...` sources can be used without writing a custom GStreamer pipeline.
 
 ## 0.1.3
 

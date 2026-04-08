@@ -68,6 +68,12 @@ print(first.boxes.id, second.boxes.id)
 yoloe-camera-gui
 ```
 
+Direct RTSP input is also supported:
+
+```bash
+yoloe-camera-gui --source rtsp://user:pass@camera.local:554/stream
+```
+
 The GUI lets you change:
 
 - the video source
