@@ -25,3 +25,7 @@
 ## 0.1.2
 
 - Set logging level of YOLOE inference messages to debug
+
+## 0.1.3
+
+- Implemented stateful object tracking using ByteTrack or BoT-SORT on top of YOLOE results
