@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 import yaml
 from ultralytics.engine.results import Results
+from yoloe_tensorrt.inputs import PreparedTensorInput
 from yoloe_tensorrt.source import SourceItem
 from yoloe_tensorrt.tracking import (
     YOLOETrackerSession,
@@ -44,8 +46,11 @@ class _FakeEngine:
         self._prompt_generation = 0
         self._results = list(results)
         self.predict_calls = 0
+        self.metadata = SimpleNamespace(max_det=17)
+        self.last_predict_kwargs: dict | None = None
 
-    def predict_item(self, **_kwargs) -> Results:
+    def _predict_input_entry(self, **_kwargs) -> Results:
+        self.last_predict_kwargs = dict(_kwargs)
         index = min(self.predict_calls, len(self._results) - 1)
         self.predict_calls += 1
         return self._results[index]
@@ -131,3 +136,47 @@ def test_tracker_session_resets_on_prompt_generation_and_source_change(monkeypat
     session.update(frame, source_key="cam1")
     assert len(backends) == 3
     assert backends[2].update_calls == 1
+
+
+def test_tracker_session_accepts_prepared_tensor_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_build_backend(_tracker: str, _config: dict, _frame_rate: int) -> _FakeTrackerBackend:
+        return _FakeTrackerBackend(
+            [
+                np.asarray([[1.0, 2.0, 10.0, 11.0, 5.0, 0.9, 0.0, 0.0]], dtype=np.float32),
+            ]
+        )
+
+    monkeypatch.setattr("yoloe_tensorrt.tracking._build_tracker_backend", _fake_build_backend)
+    engine = _FakeEngine([_make_result()])
+    session = YOLOETrackerSession(engine)
+
+    prepared = PreparedTensorInput(
+        tensor=torch.zeros((1, 3, 16, 16), dtype=torch.float32),
+        path="tensor0",
+        original_image=SourceItem(image=np.zeros((16, 16, 3), dtype=np.uint8), path="tensor0"),
+    )
+
+    tracked = session.update(prepared, input_hint="prepared", cuda=True)
+
+    assert tracked.boxes is not None
+    assert tracked.boxes.is_track
+    assert tracked.boxes.id is not None
+
+
+def test_tracker_session_uses_engine_default_max_det(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_build_backend(_tracker: str, _config: dict, _frame_rate: int) -> _FakeTrackerBackend:
+        return _FakeTrackerBackend(
+            [
+                np.asarray([[1.0, 2.0, 10.0, 11.0, 5.0, 0.9, 0.0, 0.0]], dtype=np.float32),
+            ]
+        )
+
+    monkeypatch.setattr("yoloe_tensorrt.tracking._build_tracker_backend", _fake_build_backend)
+    engine = _FakeEngine([_make_result()])
+    session = YOLOETrackerSession(engine)
+
+    frame = SourceItem(image=np.zeros((32, 32, 3), dtype=np.uint8), path="frame0")
+    session.update(frame)
+
+    assert engine.last_predict_kwargs is not None
+    assert engine.last_predict_kwargs["max_det"] == engine.metadata.max_det

@@ -2,17 +2,22 @@
 
 ## Unreleased
 
-- Prepared the repository for public release and VCS installs.
-- Added public CLI entry points: `yoloe-camera-gui`, `yoloe-export`, and `python -m yoloe_tensorrt`.
-- Reworked default asset handling so the example YOLOE checkpoint resolves from a user cache instead of a checked-in `models/` directory.
-- Added production-facing documentation, a docs site config, CI, and standard repo policy files.
-- Added an optional fallback prompt-encoder path when `mobileclip2_b.ts` is not bundled locally.
-- Added GitHub Actions CI job separation for Ruff, docs, runner-safe tests, install smoke checks, and source-distribution builds.
-- Added a tag-triggered release scaffold that verifies `pyproject.toml` and `CHANGELOG.md` before uploading release artifacts.
+## 0.2.0
 
-## 0.1.0
+- Unified `predict(...)` and `track(...)` around a single broad input surface with specialized internal routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
+- Added `PreparedTensorInput`, a prepared CUDA-tensor fast path, and a `benchmark` CLI for comparing host-image and CUDA-tensor inference through the native TensorRT runtime.
+- Extended tracker sessions to use the unified input router, support prepared tensor updates, and preserve the artifact default `max_det` behavior.
+- Fixed prepared-tensor correctness issues around integer dtype validation, CUDA producer-stream handoff, and cross-stream prepared-tensor inference.
+- Fixed unit-range float preprocessing so non-square padded inputs keep the correct scale instead of being divided by `255` a second time.
+- Expanded runtime and unit coverage for unified routing, benchmark CLI help, tracker-session input handling, and prepared-tensor regressions.
 
-- Initial package release.
+## 0.1.3
+
+- Implemented stateful object tracking using ByteTrack or BoT-SORT on top of YOLOE results
+
+## 0.1.2
+
+- Set logging level of YOLOE inference messages to debug
 
 ## 0.1.1
 
@@ -22,10 +27,6 @@
 - Added `all` option for building with extras
 - Updated native backend builds to be compatible with newer TensorRT versions
 
-## 0.1.2
+## 0.1.0
 
-- Set logging level of YOLOE inference messages to debug
-
-## 0.1.3
-
-- Implemented stateful object tracking using ByteTrack or BoT-SORT on top of YOLOE results
+- Initial package release.

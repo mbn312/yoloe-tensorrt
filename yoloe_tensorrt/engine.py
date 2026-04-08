@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator
 
+import numpy as np
 import torch
 from torch.utils.dlpack import from_dlpack
 from ultralytics.engine.results import Results
@@ -13,6 +14,7 @@ from ultralytics.utils import nms, ops
 from .artifacts import ArtifactMetadata, default_artifact_dir, load_metadata, resolve_artifact_file
 from .assets import text_asset_search_roots
 from .export import export_model
+from .inputs import InferenceSourceItem, PreparedTensorInput, iter_inference_sources, validate_prepared_tensor
 from .logging_utils import get_logger
 from .native_backend import build_native_main_runtime
 from .preprocess import normalize_imgsz, preprocess_image
@@ -24,7 +26,7 @@ from .prompts import (
     load_prompt_projector,
     resolve_text_asset_path,
 )
-from .source import SourceItem, is_finite_live_source, is_live_source, normalize_source, stream_sources
+from .source import SourceItem, is_finite_live_source, is_live_source, normalize_source
 from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
 from .trt import TensorRTRuntime
 
@@ -443,6 +445,137 @@ class YOLOEEngine:
         )
         return result
 
+    def _resolve_original_sample(
+        self,
+        original_image: SourceItem | object | None,
+        path: str | None,
+        input_shape: tuple[int, int],
+    ) -> SimpleNamespace:
+        if isinstance(original_image, SourceItem):
+            return SimpleNamespace(original=original_image.image, path=path or original_image.path)
+        if original_image is not None:
+            item = normalize_source(original_image, default_prefix="tensor")[0]
+            return SimpleNamespace(original=item.image, path=path or item.path)
+
+        fallback_path = path or "tensor0"
+        fallback_image = np.zeros((input_shape[0], input_shape[1], 3), dtype=np.uint8)
+        return SimpleNamespace(original=fallback_image, path=fallback_path)
+
+    def _predict_prepared_tensor(
+        self,
+        item: PreparedTensorInput,
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+    ) -> Results:
+        prompt_embeddings, names = self._active_prompt_embeddings()
+
+        image_tensor = item.tensor
+        validate_prepared_tensor(image_tensor)
+        if image_tensor.ndim == 3:
+            image_tensor = image_tensor.unsqueeze(0)
+        if image_tensor.ndim != 4 or int(image_tensor.shape[0]) != 1 or int(image_tensor.shape[1]) != 3:
+            raise ValueError(
+                "Prepared tensor inputs must have shape (3, H, W) or (1, 3, H, W) before they enter the fast path"
+            )
+
+        current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
+        producer_stream = item.producer_stream
+        if image_tensor.device.type != "cuda":
+            image_tensor = image_tensor.to(device=self.device)
+            producer_stream = current_stream
+        elif image_tensor.device != self.device:
+            image_tensor = image_tensor.to(device=self.device)
+            producer_stream = current_stream
+        target_dtype = torch.float16 if self._main_fp16 else torch.float32
+        if image_tensor.dtype != target_dtype:
+            image_tensor = image_tensor.to(dtype=target_dtype)
+            producer_stream = current_stream
+        contiguous_tensor = image_tensor.contiguous()
+        if contiguous_tensor.data_ptr() != image_tensor.data_ptr():
+            producer_stream = current_stream
+        image_tensor = contiguous_tensor
+        if producer_stream is None:
+            producer_stream = current_stream
+
+        input_shape = (int(image_tensor.shape[2]), int(image_tensor.shape[3]))
+        if self.native_main_runtime is not None:
+            native_outputs = self.native_main_runtime.infer_tensor(
+                int(image_tensor.data_ptr()), input_shape[0], input_shape[1], producer_stream
+            )
+            outputs = {name: from_dlpack(native_outputs[name]) for name in self._main_output_names}
+            preprocess_ms = float(native_outputs["preprocess_ms"])
+            inference_ms = float(native_outputs["inference_ms"])
+        else:
+            if self.main_runtime is None:
+                raise RuntimeError("Main runtime is not initialized")
+            inference_start = time.perf_counter()
+            outputs = self.main_runtime.infer(
+                {
+                    self.metadata.image_input_name: image_tensor,
+                    self.metadata.prompt_input_name: prompt_embeddings,
+                }
+            )
+            torch.cuda.synchronize(self.device)
+            preprocess_ms = 0.0
+            inference_ms = (time.perf_counter() - inference_start) * 1000.0
+
+        sample = self._resolve_original_sample(item.original_image, item.path, input_shape)
+        postprocess_start = time.perf_counter()
+        speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
+        result = self._postprocess_predictions(
+            outputs=outputs,
+            sample=sample,
+            input_shape=input_shape,
+            names=names,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            retina_masks=retina_masks,
+            speed=speed,
+        )
+        speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
+        result.speed = speed
+        LOGGER.debug(
+            "Completed prepared-tensor inference on '%s': input_shape=%s detections=%d "
+            "pre=%.1fms inf=%.1fms post=%.1fms",
+            sample.path,
+            input_shape,
+            int(result.boxes.data.shape[0]) if result.boxes is not None else 0,
+            speed["preprocess"],
+            speed["inference"],
+            speed["postprocess"],
+        )
+        return result
+
+    def _predict_input_entry(
+        self,
+        item: InferenceSourceItem,
+        imgsz: int | tuple[int, int] | list[int] | None,
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+    ) -> Results:
+        if isinstance(item, PreparedTensorInput):
+            return self._predict_prepared_tensor(
+                item=item,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+            )
+        target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
+        return self._predict_one(
+            item=item,
+            imgsz=target_size,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            retina_masks=retina_masks,
+        )
+
     def predict_item(
         self,
         item: SourceItem,
@@ -463,6 +596,55 @@ class YOLOEEngine:
             retina_masks=retina_masks,
         )
 
+    def prepare_cuda_input(
+        self,
+        source: SourceItem | object,
+        imgsz: int | tuple[int, int] | list[int] | None = None,
+    ) -> PreparedTensorInput:
+        item = source if isinstance(source, SourceItem) else normalize_source(source, default_prefix="tensor")[0]
+        target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
+        sample = preprocess_image(
+            item,
+            imgsz=target_size,
+            device=self.device,
+            fp16=self._main_fp16,
+            stride=self.metadata.stride,
+        )
+        return PreparedTensorInput(
+            tensor=sample.tensor,
+            path=item.path,
+            original_image=item,
+        )
+
+    def predict_cuda(
+        self,
+        tensor: torch.Tensor | object,
+        *,
+        original_image: SourceItem | object | None = None,
+        path: str | None = None,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int | None = None,
+        retina_masks: bool = False,
+    ) -> Results:
+        resolved_max_det = int(max_det or self.metadata.max_det)
+        prepared = (
+            tensor
+            if isinstance(tensor, PreparedTensorInput)
+            else PreparedTensorInput(
+                tensor=tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor),
+                path=path or "tensor0",
+                original_image=original_image,
+            )
+        )
+        return self._predict_prepared_tensor(
+            item=prepared,
+            conf=conf,
+            iou=iou,
+            max_det=resolved_max_det,
+            retina_masks=retina_masks,
+        )
+
     def _predict_iter(
         self,
         source: object,
@@ -471,9 +653,20 @@ class YOLOEEngine:
         iou: float,
         max_det: int,
         retina_masks: bool,
+        cuda: bool | None,
+        input_hint: str | None,
+        original_image: SourceItem | object | None,
+        path: str | None,
     ) -> Iterator[Results]:
-        for item in stream_sources(source):
-            yield self.predict_item(
+        for item in iter_inference_sources(
+            source,
+            default_prefix="frame",
+            input_hint=input_hint,
+            cuda=cuda,
+            original_image=original_image,
+            path=path,
+        ):
+            yield self._predict_input_entry(
                 item=item,
                 imgsz=imgsz,
                 conf=conf,
@@ -506,13 +699,24 @@ class YOLOEEngine:
         tracker: str,
         tracker_config: str | Path | dict | None,
         frame_rate: int,
+        cuda: bool | None,
+        input_hint: str | None,
+        original_image: SourceItem | object | None,
+        path: str | None,
     ) -> Iterator[Results]:
         session = self.create_tracker(
             tracker=tracker,
             tracker_config=tracker_config,
             frame_rate=frame_rate,
         )
-        for item in stream_sources(source):
+        for item in iter_inference_sources(
+            source,
+            default_prefix="frame",
+            input_hint=input_hint,
+            cuda=cuda,
+            original_image=original_image,
+            path=path,
+        ):
             yield session.update(
                 item,
                 imgsz=imgsz,
@@ -531,6 +735,10 @@ class YOLOEEngine:
         iou: float = 0.45,
         max_det: int | None = None,
         retina_masks: bool = False,
+        cuda: bool | None = None,
+        input_hint: str | None = None,
+        original_image: SourceItem | object | None = None,
+        path: str | None = None,
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         resolved_max_det = int(max_det or self.metadata.max_det)
@@ -551,6 +759,10 @@ class YOLOEEngine:
             iou=iou,
             max_det=resolved_max_det,
             retina_masks=retina_masks,
+            cuda=cuda,
+            input_hint=input_hint,
+            original_image=original_image,
+            path=path,
         )
         if stream:
             return results
@@ -568,6 +780,10 @@ class YOLOEEngine:
         tracker: str = DEFAULT_TRACKER,
         tracker_config: str | Path | dict | None = None,
         frame_rate: int = 30,
+        cuda: bool | None = None,
+        input_hint: str | None = None,
+        original_image: SourceItem | object | None = None,
+        path: str | None = None,
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         resolved_max_det = int(max_det or self.metadata.max_det)
@@ -592,6 +808,10 @@ class YOLOEEngine:
             tracker=tracker,
             tracker_config=tracker_config,
             frame_rate=frame_rate,
+            cuda=cuda,
+            input_hint=input_hint,
+            original_image=original_image,
+            path=path,
         )
         if stream:
             return results

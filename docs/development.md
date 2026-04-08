@@ -33,11 +33,13 @@ PYTHONPYCACHEPREFIX=outputs/pycache python -m pytest -q \
   tests/test_assets.py \
   tests/test_cli.py \
   tests/test_gui_helpers.py \
+  tests/test_inputs.py \
   tests/test_logging.py \
   tests/test_prompts.py \
   tests/test_release_metadata.py \
   tests/test_text_encoder_fallback.py \
-  tests/test_export.py
+  tests/test_export.py \
+  tests/test_tracking.py
 ```
 
 ## Integration verification
@@ -50,6 +52,16 @@ YOLOE_TRT_BUILDER_OPT_LEVEL=0 \
 YOLOE_TRT_AVG_TIMING_ITERATIONS=1 \
 python -m pytest -s -o log_cli=true --log-cli-level=INFO \
   tests/test_runtime_integration.py -m integration
+```
+
+## Performance checks
+
+The public API is unified around `YOLOEEngine.predict(...)` and `YOLOEEngine.track(...)`, but the lowest-overhead headless
+route is still the prepared-tensor path returned by `YOLOEEngine.prepare_cuda_input(...)`. Benchmark host-image vs
+prepared-tensor inference with:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
 ```
 
 ## CI and release automation

@@ -19,6 +19,29 @@ results = engine.predict("tests/assets/images/bus.jpg")
 print(results[0].names)
 ```
 
+## Run the prepared-tensor fast path
+
+```python
+from yoloe_tensorrt import YOLOEEngine
+
+engine = YOLOEEngine.from_engine("outputs/artifacts/yoloe26s")
+engine.set_classes(["bus"])
+prepared = engine.prepare_cuda_input("tests/assets/images/bus.jpg")
+result = engine.predict(prepared)[0]
+print(result.speed)
+```
+
+If you already have a model-ready tensor, keep using the same public API and mark it explicitly:
+
+```python
+result = engine.predict(
+    your_tensor,
+    input_hint="prepared",
+    original_image="tests/assets/images/bus.jpg",
+    path="bus.jpg",
+)[0]
+```
+
 ## Track objects across frames
 
 ```python
@@ -54,3 +77,9 @@ The GUI lets you change:
 - the tracker backend (`bytetrack` or `botsort`)
 
 All from the same window while the stream is running.
+
+## Benchmark current paths
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
+```
