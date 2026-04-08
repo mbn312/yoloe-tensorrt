@@ -13,6 +13,17 @@ LOGGER = get_logger(__name__)
 _GST = None
 _GST_APP = None
 _GST_VIDEO = None
+_RTSP_SCHEMES = (
+    "rtsp://",
+    "rtsps://",
+    "rtspu://",
+    "rtspt://",
+    "rtsph://",
+    "rtsp-sdp://",
+    "rtspsu://",
+    "rtspst://",
+    "rtspsh://",
+)
 
 
 def _require_gst():
@@ -38,6 +49,16 @@ def _require_gst():
     _GST_APP = GstApp
     _GST_VIDEO = GstVideo
     return Gst, GstApp, GstVideo
+
+
+def is_rtsp_uri(source_value: str | Path) -> bool:
+    source_text = str(source_value).strip().lower()
+    return source_text.startswith(_RTSP_SCHEMES)
+
+
+def _gst_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def build_usb_camera_pipeline(
@@ -69,6 +90,36 @@ def build_usb_camera_pipeline(
     return pipeline
 
 
+def build_rtsp_pipeline(
+    uri: str,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    appsink_name: str = "sink",
+) -> str:
+    pipeline = (
+        f"uridecodebin uri={_gst_quote(str(uri).strip())} use-buffering=false ! "
+        "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        "autovideoconvert ! video/x-raw ! "
+    )
+
+    caps_parts = ["format=BGR"]
+    if width is not None or height is not None or fps is not None:
+        pipeline += "videoscale ! videorate ! "
+        if width is not None:
+            caps_parts.append(f"width={int(width)}")
+        if height is not None:
+            caps_parts.append(f"height={int(height)}")
+        if fps is not None:
+            caps_parts.append(f"framerate={int(fps)}/1")
+
+    caps = "video/x-raw," + ",".join(caps_parts)
+    pipeline += (
+        f"videoconvert ! {caps} ! appsink name={appsink_name} emit-signals=false max-buffers=1 drop=true sync=false"
+    )
+    return pipeline
+
+
 def build_dummy_video_pipeline(
     width: int = 640,
     height: int = 480,
@@ -88,15 +139,28 @@ def build_dummy_video_pipeline(
 def camera_source_from_spec(
     source_value: str | Path,
     *,
-    width: int = 640,
-    height: int = 480,
-    fps: int = 30,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
     timeout_s: float = 5.0,
     prefix: str = "camera",
     max_frames: int | None = None,
 ) -> GStreamerSource:
     source_text = str(source_value).strip()
     lowered = source_text.lower()
+    resolved_width = 640 if width is None else int(width)
+    resolved_height = 480 if height is None else int(height)
+    resolved_fps = 30 if fps is None else int(fps)
+    if is_rtsp_uri(source_text):
+        return GStreamerSource.rtsp(
+            source_text,
+            width=width,
+            height=height,
+            fps=fps,
+            max_frames=max_frames,
+            timeout_s=timeout_s,
+            prefix=prefix,
+        )
     if "!" in source_text:
         return GStreamerSource(
             pipeline=source_text,
@@ -109,9 +173,9 @@ def camera_source_from_spec(
         pattern = pattern or "ball"
         return GStreamerSource(
             pipeline=build_dummy_video_pipeline(
-                width=width,
-                height=height,
-                fps=fps,
+                width=resolved_width,
+                height=resolved_height,
+                fps=resolved_fps,
                 pattern=pattern,
             ),
             prefix=prefix,
@@ -124,9 +188,9 @@ def camera_source_from_spec(
         raise FileNotFoundError(f"Camera source device is missing: {device_path}")
     return GStreamerSource.usb_camera(
         device=device_path,
-        width=width,
-        height=height,
-        fps=fps,
+        width=resolved_width,
+        height=resolved_height,
+        fps=resolved_fps,
         max_frames=max_frames,
         timeout_s=timeout_s,
         prefix=prefix,
@@ -141,6 +205,29 @@ class GStreamerSource(SourceStream):
     timeout_s: float = 5.0
     appsink_name: str = "sink"
     is_live_source: bool = True
+
+    @classmethod
+    def rtsp(
+        cls,
+        uri: str,
+        width: int | None = None,
+        height: int | None = None,
+        fps: int | None = None,
+        max_frames: int | None = None,
+        timeout_s: float = 5.0,
+        prefix: str | None = None,
+    ) -> GStreamerSource:
+        return cls(
+            pipeline=build_rtsp_pipeline(
+                uri,
+                width=width,
+                height=height,
+                fps=fps,
+            ),
+            prefix=prefix or "rtsp",
+            max_frames=max_frames,
+            timeout_s=timeout_s,
+        )
 
     @classmethod
     def usb_camera(

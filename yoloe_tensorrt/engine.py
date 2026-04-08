@@ -14,7 +14,12 @@ from ultralytics.utils import nms, ops
 from .artifacts import ArtifactMetadata, default_artifact_dir, load_metadata, resolve_artifact_file
 from .assets import text_asset_search_roots
 from .export import export_model
-from .inputs import InferenceSourceItem, PreparedTensorInput, iter_inference_sources, validate_prepared_tensor
+from .inputs import (
+    InferenceSourceItem,
+    PreparedTensorInput,
+    iter_inference_sources,
+    validate_prepared_tensor,
+)
 from .logging_utils import get_logger
 from .native_backend import build_native_main_runtime
 from .preprocess import normalize_imgsz, preprocess_image
@@ -26,7 +31,7 @@ from .prompts import (
     load_prompt_projector,
     resolve_text_asset_path,
 )
-from .source import SourceItem, is_finite_live_source, is_live_source, normalize_source
+from .source import SourceItem, normalize_source
 from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
 from .trt import TensorRTRuntime
 
@@ -657,12 +662,14 @@ class YOLOEEngine:
         input_hint: str | None,
         original_image: SourceItem | object | None,
         path: str | None,
+        allow_unbounded_live: bool = True,
     ) -> Iterator[Results]:
         for item in iter_inference_sources(
             source,
             default_prefix="frame",
             input_hint=input_hint,
             cuda=cuda,
+            allow_unbounded_live=allow_unbounded_live,
             original_image=original_image,
             path=path,
         ):
@@ -703,6 +710,7 @@ class YOLOEEngine:
         input_hint: str | None,
         original_image: SourceItem | object | None,
         path: str | None,
+        allow_unbounded_live: bool = True,
     ) -> Iterator[Results]:
         session = self.create_tracker(
             tracker=tracker,
@@ -714,6 +722,7 @@ class YOLOEEngine:
             default_prefix="frame",
             input_hint=input_hint,
             cuda=cuda,
+            allow_unbounded_live=allow_unbounded_live,
             original_image=original_image,
             path=path,
         ):
@@ -742,8 +751,6 @@ class YOLOEEngine:
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         resolved_max_det = int(max_det or self.metadata.max_det)
-        if is_live_source(source) and not stream and not is_finite_live_source(source):
-            raise ValueError("Live sources require stream=True or an explicit max_frames limit")
         LOGGER.debug(
             "Starting predict(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d)",
             stream,
@@ -763,6 +770,7 @@ class YOLOEEngine:
             input_hint=input_hint,
             original_image=original_image,
             path=path,
+            allow_unbounded_live=stream,
         )
         if stream:
             return results
@@ -787,8 +795,6 @@ class YOLOEEngine:
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         resolved_max_det = int(max_det or self.metadata.max_det)
-        if is_live_source(source) and not stream and not is_finite_live_source(source):
-            raise ValueError("Live sources require stream=True or an explicit max_frames limit")
         LOGGER.debug(
             "Starting track(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d, tracker=%s)",
             stream,
@@ -812,6 +818,7 @@ class YOLOEEngine:
             input_hint=input_hint,
             original_image=original_image,
             path=path,
+            allow_unbounded_live=stream,
         )
         if stream:
             return results

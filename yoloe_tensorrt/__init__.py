@@ -9,6 +9,7 @@ __all__ = [
     "configure_logging",
     "GStreamerSource",
     "build_usb_camera_pipeline",
+    "build_rtsp_pipeline",
     "build_dummy_video_pipeline",
     "camera_source_from_spec",
     "run_camera_gui",
@@ -46,6 +47,10 @@ def __getattr__(name: str):
         from .gstreamer import build_usb_camera_pipeline
 
         return build_usb_camera_pipeline
+    if name == "build_rtsp_pipeline":
+        from .gstreamer import build_rtsp_pipeline
+
+        return build_rtsp_pipeline
     if name == "build_dummy_video_pipeline":
         from .gstreamer import build_dummy_video_pipeline
 

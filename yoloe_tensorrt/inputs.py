@@ -9,8 +9,18 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .gstreamer import camera_source_from_spec, is_rtsp_uri
 from .logging_utils import get_logger
-from .source import SourceItem, SourceStream, _is_iterable_source, _load_path, _normalize_array, _pil_to_bgr
+from .source import (
+    SourceItem,
+    SourceStream,
+    _is_iterable_source,
+    _load_path,
+    _normalize_array,
+    _pil_to_bgr,
+    is_finite_live_source,
+    is_live_source,
+)
 
 LOGGER = get_logger(__name__)
 
@@ -64,6 +74,7 @@ def normalize_inference_source(
             default_prefix=default_prefix,
             input_hint=input_hint,
             cuda=cuda,
+            allow_unbounded_live=False,
             original_image=original_image,
             path=path,
         )
@@ -80,11 +91,14 @@ def iter_inference_sources(
     default_prefix: str = "image",
     input_hint: str | None = None,
     cuda: bool | None = None,
+    allow_unbounded_live: bool = True,
     original_image: SourceItem | object | None = None,
     path: str | None = None,
 ) -> Iterator[InferenceSourceItem]:
     hint = normalize_input_hint(input_hint)
     if isinstance(source, SourceStream):
+        if not allow_unbounded_live and is_live_source(source) and not is_finite_live_source(source):
+            raise ValueError("Live sources require stream=True or an explicit max_frames limit")
         yield from source
         return
     if isinstance(source, (SourceItem, PreparedTensorInput)):
@@ -101,6 +115,17 @@ def iter_inference_sources(
         )
         return
     if isinstance(source, (str, Path)):
+        if is_rtsp_uri(source):
+            if not allow_unbounded_live:
+                raise ValueError("Live sources require stream=True or an explicit max_frames limit")
+            yield from camera_source_from_spec(
+                source,
+                width=None,
+                height=None,
+                fps=None,
+                prefix=path or "rtsp",
+            )
+            return
         yield _load_path(source)
         return
     if isinstance(source, Image.Image):
@@ -117,6 +142,7 @@ def iter_inference_sources(
                 default_prefix=f"{default_prefix}{index}",
                 input_hint=hint,
                 cuda=cuda,
+                allow_unbounded_live=allow_unbounded_live,
                 original_image=None,
                 path=item_path,
             )

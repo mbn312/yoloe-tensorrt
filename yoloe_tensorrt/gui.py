@@ -618,7 +618,12 @@ def run_camera_gui(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch the YOLOE TensorRT live camera GUI.")
-    parser.add_argument("--source", default=DEFAULT_GUI_SOURCE, help="Initial camera source. Defaults to /dev/video0.")
+    parser.add_argument(
+        "--source",
+        default=DEFAULT_GUI_SOURCE,
+        help="Initial camera source. Accepts /dev/video*, rtsp://..., videotest://..., or a raw GStreamer pipeline. "
+        "Defaults to /dev/video0.",
+    )
     parser.add_argument(
         "--label",
         action="append",
