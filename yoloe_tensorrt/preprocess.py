@@ -38,14 +38,26 @@ def preprocess_image(
 ) -> PreprocessedSample:
     target_shape = normalize_imgsz(imgsz)
     LOGGER.debug("Preprocessing '%s' from shape=%s to target_shape=%s", item.path, item.image.shape[:2], target_shape)
-    transformed = LetterBox(new_shape=target_shape, auto=False, stride=stride)(image=item.image)
+    input_image = item.image
+    scale = True
+    if np.issubdtype(input_image.dtype, np.floating):
+        max_value = float(input_image.max())
+        min_value = float(input_image.min())
+        if 0.0 <= min_value and max_value <= 1.0:
+            input_image = np.ascontiguousarray(input_image.astype(np.float32, copy=False) * 255.0)
+        else:
+            scale = max_value > 1.0 or min_value < 0.0
+
+    transformed = LetterBox(new_shape=target_shape, auto=False, stride=stride)(image=input_image)
     array = transformed
     if array.shape[-1] == 3:
         array = array[..., ::-1]
     array = np.ascontiguousarray(array.transpose((2, 0, 1)))
     tensor = torch_from_numpy_safe(array, device=device)
-    tensor = tensor.half() if fp16 else tensor.float()
-    tensor /= 255.0
+    tensor = tensor.float()
+    if scale:
+        tensor /= 255.0
+    tensor = tensor.half() if fp16 else tensor
     tensor = tensor.unsqueeze(0)
     LOGGER.debug(
         "Prepared tensor for '%s' with shape=%s dtype=%s", item.path, tuple(int(v) for v in tensor.shape), tensor.dtype

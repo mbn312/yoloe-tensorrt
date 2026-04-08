@@ -8,6 +8,7 @@
 - Optional visual prompts for YOLOE detection and segmentation models
 - Stateful object tracking with ByteTrack or BoT-SORT on top of YOLOE results
 - Native C++ TensorRT main-engine runtime with GPU output handoff back to Python
+- Unified `predict(...)` and `track(...)` APIs with a prepared-tensor fast path
 - Python package API, export CLI, and live camera GUI
 - Jetson-first deployment model with Linux x86_64 CUDA/TensorRT also supported
 
@@ -118,6 +119,29 @@ results = engine.predict("tests/assets/images/bus.jpg")
 print(results[0].boxes.data.shape[0], results[0].names)
 ```
 
+Run the lowest-overhead headless path through the unified API:
+
+```python
+from yoloe_tensorrt import YOLOEEngine
+
+engine = YOLOEEngine.from_engine("outputs/artifacts/yoloe26s")
+engine.set_classes(["bus"])
+prepared = engine.prepare_cuda_input("tests/assets/images/bus.jpg")
+result = engine.predict(prepared)[0]
+print(result.boxes.data.shape[0], result.speed)
+```
+
+If you already have a model-ready tensor, route it through the same API explicitly:
+
+```python
+result = engine.predict(
+    your_tensor,
+    input_hint="prepared",
+    original_image="tests/assets/images/bus.jpg",
+    path="bus.jpg",
+)[0]
+```
+
 Track objects across frames:
 
 ```python
@@ -147,6 +171,12 @@ Repo-local convenience launcher:
 scripts/launch_camera_gui.sh
 ```
 
+Benchmark host-image vs CUDA-tensor paths:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
+```
+
 ## CI/CD
 
 GitHub Actions is the supported automation path for this repository.
@@ -168,6 +198,9 @@ GitHub Actions is the supported automation path for this repository.
 - The main inference engine path is native C++/TensorRT.
 - Prompt compilation, visual prompt orchestration, and Ultralytics `Results` wrapping still live in Python.
 - Tracking is stateful and currently runs in Python on top of the detection/segmentation results.
+- `predict(...)` and `track(...)` choose the fastest supported internal path for the input representation they are given.
+- The prepared-tensor fast path is reached by passing the object returned from `prepare_cuda_input(...)` or by using `input_hint="prepared"`.
+- Plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors are still accepted without requiring manual preprocessing.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
 - Live USB camera input is available through a GStreamer appsink pipeline. Jetson zero-copy camera ingest is still on the roadmap.
 - If you do not have a camera attached, use `videotest://<pattern>` such as `videotest://ball` or `videotest://smpte`.

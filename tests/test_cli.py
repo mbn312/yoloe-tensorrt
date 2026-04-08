@@ -19,6 +19,7 @@ def test_module_entrypoint_displays_help() -> None:
     assert "CLI entry points for yoloe-tensorrt." in result.stdout
     assert "camera-gui" in result.stdout
     assert "export" in result.stdout
+    assert "benchmark" in result.stdout
 
 
 def test_export_cli_displays_help() -> None:
@@ -45,3 +46,16 @@ def test_camera_gui_cli_displays_help() -> None:
     assert "Launch the YOLOE TensorRT live camera GUI." in result.stdout
     assert "--track" in result.stdout
     assert "--tracker" in result.stdout
+
+
+def test_benchmark_cli_displays_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "yoloe_tensorrt", "benchmark", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0
+    assert "Benchmark host-image and CUDA-tensor inference" in result.stdout
+    assert "--mode" in result.stdout

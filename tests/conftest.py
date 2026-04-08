@@ -25,7 +25,9 @@ TEST_IMAGES = {
 }
 USB_CAMERA_DEVICE = Path(os.environ.get("YOLOE_TRT_TEST_CAMERA_DEVICE", "/dev/video0"))
 DEFAULT_CAMERA_SOURCE = (
-    os.environ.get("YOLOE_TRT_TEST_CAMERA_SOURCE") or str(USB_CAMERA_DEVICE) if USB_CAMERA_DEVICE.exists() else "videotest://ball"
+    os.environ.get("YOLOE_TRT_TEST_CAMERA_SOURCE") or str(USB_CAMERA_DEVICE)
+    if USB_CAMERA_DEVICE.exists()
+    else "videotest://ball"
 )
 
 

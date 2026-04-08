@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 from PIL import Image
-from yoloe_tensorrt import GStreamerSource, YOLOEEngine
+from yoloe_tensorrt import GStreamerSource, PreparedTensorInput, YOLOEEngine
 
 TEST_CONF = 0.1
 
@@ -112,6 +114,63 @@ def test_engine_predicts_bus_image_with_visual_prompt(
 
 
 @pytest.mark.integration
+def test_engine_predict_uses_fast_prepared_tensor_path_by_default(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+
+    image_path = test_images["bus"]
+    prepared_input = runtime_engine.prepare_cuda_input(image_path)
+
+    result = runtime_engine.predict(prepared_input, conf=TEST_CONF)[0]
+
+    _assert_result_contract(result, image_path, _expected_names(labels))
+    assert result.speed["preprocess"] == pytest.approx(0.0)
+    assert result.boxes.data.shape[0] >= 1
+
+
+@pytest.mark.integration
+def test_engine_prepared_fast_path_rejects_integer_tensors(
+    runtime_engine: YOLOEEngine,
+) -> None:
+    runtime_engine.clear_prompts()
+    runtime_engine.set_classes(["bus"])
+
+    prepared = PreparedTensorInput(
+        tensor=torch.zeros((1, 3, 32, 32), dtype=torch.uint8),
+        path="tensor0",
+    )
+
+    with pytest.raises(ValueError, match="floating point dtype"):
+        runtime_engine.predict(prepared)
+
+
+@pytest.mark.integration
+def test_engine_predict_accepts_raw_cpu_tensor_inputs(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+
+    image_path = test_images["bus"]
+    with Image.open(image_path) as image:
+        rgb = image.convert("RGB")
+        tensor = torch.from_numpy(np.asarray(rgb).copy()).permute(2, 0, 1).float() / 255.0
+
+    result = runtime_engine.predict(tensor, conf=TEST_CONF, path=image_path.name)[0]
+
+    assert Path(result.path).name == image_path.name
+    assert result.names == _expected_names(labels)
+    assert result.boxes is not None
+    assert result.boxes.data.shape[0] >= 1
+
+
+@pytest.mark.integration
 def test_engine_streams_live_camera_source_frames_with_runtime_camera_prompts(
     runtime_engine: YOLOEEngine,
     usb_camera_source: GStreamerSource,
@@ -185,6 +244,29 @@ def test_tracker_session_updates_frames_incrementally(
     _assert_tracked_result_contract(second, image_path, _expected_names(labels))
     assert first.boxes.data.shape[0] >= 1
     assert second.boxes.data.shape[0] >= 1
+    assert {int(track_id) for track_id in first.boxes.id.tolist()} & {
+        int(track_id) for track_id in second.boxes.id.tolist()
+    }
+
+
+@pytest.mark.integration
+def test_tracker_session_updates_gpu_frames_incrementally(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    image_path = test_images["bus"]
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+    session = runtime_engine.create_tracker(tracker="bytetrack", frame_rate=30)
+
+    prepared_input = runtime_engine.prepare_cuda_input(image_path)
+
+    first = session.update(prepared_input, conf=TEST_CONF)
+    second = session.update(prepared_input, conf=TEST_CONF)
+
+    _assert_tracked_result_contract(first, image_path, _expected_names(labels))
+    _assert_tracked_result_contract(second, image_path, _expected_names(labels))
     assert {int(track_id) for track_id in first.boxes.id.tolist()} & {
         int(track_id) for track_id in second.boxes.id.tolist()
     }

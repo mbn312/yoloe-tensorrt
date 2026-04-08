@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -416,17 +417,26 @@ public:
         execute(image_buffer_.data(), target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
         auto const inference_ms = std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
 
-        py::dict outputs;
-        for (std::size_t i = 0; i < output_indices_.size(); ++i) {
-            auto const binding_index = output_indices_[i];
-            auto const& binding = bindings_[binding_index];
-            outputs[py::str(binding.name)] = py::cast(
-                CudaTensorView(shared_from_this(), output_buffers_[i].data(), output_shapes_[i], binding.dtype, device_id_));
+        return build_output_dict(target_h, target_w, preprocess_ms, inference_ms);
+    }
+
+    py::dict infer_tensor(std::uintptr_t image_ptr_value, int target_h, int target_w, std::uintptr_t producer_stream_value = 0)
+    {
+        if (!has_prompt_embeddings_) {
+            throw std::runtime_error("No prompt embeddings are active");
         }
-        outputs[py::str("input_shape")] = py::make_tuple(target_h, target_w);
-        outputs[py::str("preprocess_ms")] = preprocess_ms;
-        outputs[py::str("inference_ms")] = inference_ms;
-        return outputs;
+        if (image_ptr_value == 0) {
+            throw std::runtime_error("image tensor pointer must not be null");
+        }
+
+        auto* image_ptr = reinterpret_cast<void*>(image_ptr_value);
+        auto* producer_stream = reinterpret_cast<cudaStream_t>(producer_stream_value);
+        wait_for_producer_stream(producer_stream);
+        auto const inference_start = Clock::now();
+        execute(image_ptr, target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
+        auto const inference_ms = std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
+
+        return build_output_dict(target_h, target_w, 0.0, inference_ms);
     }
 
     void warmup(int target_h, int target_w, int prompt_count, int runs)
@@ -459,6 +469,47 @@ public:
     }
 
 private:
+    void wait_for_producer_stream(cudaStream_t producer_stream)
+    {
+        if (producer_stream == nullptr || producer_stream == stream_) {
+            return;
+        }
+
+        cudaEvent_t ready_event = nullptr;
+        throw_if_cuda_failed(
+            cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming),
+            "cudaEventCreateWithFlags failed for prepared tensor handoff");
+
+        try {
+            throw_if_cuda_failed(
+                cudaEventRecord(ready_event, producer_stream),
+                "cudaEventRecord failed for prepared tensor handoff");
+            throw_if_cuda_failed(
+                cudaStreamWaitEvent(stream_, ready_event, 0),
+                "cudaStreamWaitEvent failed for prepared tensor handoff");
+        } catch (...) {
+            cudaEventDestroy(ready_event);
+            throw;
+        }
+
+        throw_if_cuda_failed(cudaEventDestroy(ready_event), "cudaEventDestroy failed for prepared tensor handoff");
+    }
+
+    py::dict build_output_dict(int target_h, int target_w, double preprocess_ms, double inference_ms)
+    {
+        py::dict outputs;
+        for (std::size_t i = 0; i < output_indices_.size(); ++i) {
+            auto const binding_index = output_indices_[i];
+            auto const& binding = bindings_[binding_index];
+            outputs[py::str(binding.name)] = py::cast(
+                CudaTensorView(shared_from_this(), output_buffers_[i].data(), output_shapes_[i], binding.dtype, device_id_));
+        }
+        outputs[py::str("input_shape")] = py::make_tuple(target_h, target_w);
+        outputs[py::str("preprocess_ms")] = preprocess_ms;
+        outputs[py::str("inference_ms")] = inference_ms;
+        return outputs;
+    }
+
     int find_binding_index(std::string const& name, bool is_input) const
     {
         for (auto const& binding : bindings_) {
@@ -682,5 +733,12 @@ PYBIND11_MODULE(_native, m)
         .def("clear_prompt_embeddings", &NativeMainRuntime::clear_prompt_embeddings)
         .def("set_prompt_embeddings", &NativeMainRuntime::set_prompt_embeddings, py::arg("prompt_embeddings"))
         .def("infer_image", &NativeMainRuntime::infer_image, py::arg("image"), py::arg("target_h"), py::arg("target_w"))
+        .def(
+            "infer_tensor",
+            &NativeMainRuntime::infer_tensor,
+            py::arg("image_ptr"),
+            py::arg("target_h"),
+            py::arg("target_w"),
+            py::arg("producer_stream") = 0)
         .def("warmup", &NativeMainRuntime::warmup, py::arg("target_h"), py::arg("target_w"), py::arg("prompt_count"), py::arg("runs") = 2);
 }

@@ -4,6 +4,7 @@ __all__ = [
     "__version__",
     "YOLOEEngine",
     "YOLOETrackerSession",
+    "PreparedTensorInput",
     "export_model",
     "configure_logging",
     "GStreamerSource",
@@ -25,6 +26,10 @@ def __getattr__(name: str):
         from .export import export_model
 
         return export_model
+    if name == "PreparedTensorInput":
+        from .inputs import PreparedTensorInput
+
+        return PreparedTensorInput
     if name == "YOLOETrackerSession":
         from .tracking import YOLOETrackerSession
 
