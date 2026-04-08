@@ -43,3 +43,5 @@ def test_camera_gui_cli_displays_help() -> None:
     )
     assert result.returncode == 0
     assert "Launch the YOLOE TensorRT live camera GUI." in result.stdout
+    assert "--track" in result.stdout
+    assert "--tracker" in result.stdout

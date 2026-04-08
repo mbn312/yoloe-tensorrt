@@ -126,3 +126,65 @@ def test_engine_streams_live_camera_source_frames_with_runtime_camera_prompts(
     for index, result in enumerate(results):
         _assert_live_result_contract(result, _expected_names(camera_labels), f"{usb_camera_source.prefix}_frame")
         assert Path(result.path).name == f"{usb_camera_source.prefix}_frame{index:06d}"
+
+
+def _assert_tracked_result_contract(result, image_path: Path, expected_names: dict[int, str]) -> None:
+    with Image.open(image_path) as image:
+        expected_shape = (image.height, image.width)
+
+    assert Path(result.path).name == image_path.name
+    assert result.orig_shape == expected_shape
+    assert result.names == expected_names
+    assert result.boxes is not None
+    assert result.boxes.data.ndim == 2
+    assert result.boxes.data.shape[1] == 7
+    assert result.boxes.is_track
+    assert result.boxes.id is not None
+    if result.masks is not None:
+        assert tuple(result.masks.orig_shape) == expected_shape
+        assert result.masks.data.shape[0] == result.boxes.data.shape[0]
+
+
+@pytest.mark.integration
+def test_engine_track_assigns_stable_ids_on_repeated_frames(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    image_path = test_images["bus"]
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+
+    results = list(runtime_engine.track([image_path, image_path], stream=True, conf=TEST_CONF, tracker="bytetrack"))
+
+    assert len(results) == 2
+    for result in results:
+        _assert_tracked_result_contract(result, image_path, _expected_names(labels))
+        assert result.boxes.data.shape[0] >= 1
+
+    first_ids = {int(track_id) for track_id in results[0].boxes.id.tolist()}
+    second_ids = {int(track_id) for track_id in results[1].boxes.id.tolist()}
+    assert first_ids & second_ids
+
+
+@pytest.mark.integration
+def test_tracker_session_updates_frames_incrementally(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    image_path = test_images["bus"]
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+    session = runtime_engine.create_tracker(tracker="bytetrack", frame_rate=30)
+
+    first = session.update(image_path, conf=TEST_CONF)
+    second = session.update(image_path, conf=TEST_CONF)
+
+    _assert_tracked_result_contract(first, image_path, _expected_names(labels))
+    _assert_tracked_result_contract(second, image_path, _expected_names(labels))
+    assert first.boxes.data.shape[0] >= 1
+    assert second.boxes.data.shape[0] >= 1
+    assert {int(track_id) for track_id in first.boxes.id.tolist()} & {
+        int(track_id) for track_id in second.boxes.id.tolist()
+    }

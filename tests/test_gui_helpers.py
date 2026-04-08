@@ -35,6 +35,8 @@ def test_python_launcher_displays_help() -> None:
     )
     assert result.returncode == 0
     assert "Launch the YOLOE TensorRT live camera GUI." in result.stdout
+    assert "--track" in result.stdout
+    assert "--tracker" in result.stdout
 
 
 def test_shell_launcher_prefers_console_script_when_available(tmp_path: Path) -> None:

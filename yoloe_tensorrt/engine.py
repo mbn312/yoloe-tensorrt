@@ -25,6 +25,7 @@ from .prompts import (
     resolve_text_asset_path,
 )
 from .source import SourceItem, is_finite_live_source, is_live_source, normalize_source, stream_sources
+from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
 from .trt import TensorRTRuntime
 
 LOGGER = get_logger(__name__)
@@ -55,6 +56,7 @@ class YOLOEEngine:
         self._visual_prompt_embeddings: torch.Tensor | None = None
         self._text_names: list[str] = []
         self._visual_names: list[str] = []
+        self._prompt_generation = 0
         LOGGER.info(
             "Initialized YOLOEEngine with artifact_dir='%s', task=%s, device=%s native=%s",
             self.artifact_dir,
@@ -187,11 +189,15 @@ class YOLOEEngine:
             return
         self.native_main_runtime.set_prompt_embeddings(embeddings.detach().float().cpu().contiguous().numpy())
 
+    def _bump_prompt_generation(self) -> None:
+        self._prompt_generation += 1
+
     def clear_prompts(self) -> None:
         self._text_prompt_embeddings = None
         self._visual_prompt_embeddings = None
         self._text_names = []
         self._visual_names = []
+        self._bump_prompt_generation()
         self._sync_native_prompt_embeddings()
         LOGGER.info("Cleared active text and visual prompts")
 
@@ -206,6 +212,7 @@ class YOLOEEngine:
         )
         self._text_prompt_embeddings = embeddings.to(self.device)
         self._text_names = resolved
+        self._bump_prompt_generation()
         self._sync_native_prompt_embeddings()
         LOGGER.info("Activated %d text prompt class(es): %s", len(resolved), resolved)
 
@@ -230,6 +237,7 @@ class YOLOEEngine:
         self._visual_prompt_embeddings = None
         self._text_names = resolved
         self._visual_names = []
+        self._bump_prompt_generation()
         self._sync_native_prompt_embeddings()
         LOGGER.info("Activated %d external prompt embedding(s): %s", len(resolved), resolved)
 
@@ -270,6 +278,7 @@ class YOLOEEngine:
         prompt_output_name = self.visual_runtime.output_names[0]
         self._visual_prompt_embeddings = outputs[prompt_output_name].float()
         self._visual_names = prompt_batch.names
+        self._bump_prompt_generation()
         self._sync_native_prompt_embeddings()
         LOGGER.info(
             "Activated %d visual prompt class(es): %s",
@@ -473,6 +482,46 @@ class YOLOEEngine:
                 retina_masks=retina_masks,
             )
 
+    def create_tracker(
+        self,
+        tracker: str = DEFAULT_TRACKER,
+        tracker_config: str | Path | dict | None = None,
+        frame_rate: int = 30,
+    ) -> YOLOETrackerSession:
+        return YOLOETrackerSession(
+            self,
+            tracker=tracker,
+            tracker_config=tracker_config,
+            frame_rate=frame_rate,
+        )
+
+    def _track_iter(
+        self,
+        source: object,
+        imgsz: tuple[int, int],
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+        tracker: str,
+        tracker_config: str | Path | dict | None,
+        frame_rate: int,
+    ) -> Iterator[Results]:
+        session = self.create_tracker(
+            tracker=tracker,
+            tracker_config=tracker_config,
+            frame_rate=frame_rate,
+        )
+        for item in stream_sources(source):
+            yield session.update(
+                item,
+                imgsz=imgsz,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+            )
+
     def predict(
         self,
         source: object,
@@ -502,6 +551,47 @@ class YOLOEEngine:
             iou=iou,
             max_det=resolved_max_det,
             retina_masks=retina_masks,
+        )
+        if stream:
+            return results
+        return list(results)
+
+    def track(
+        self,
+        source: object,
+        stream: bool = False,
+        imgsz: int | tuple[int, int] | list[int] | None = None,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int | None = None,
+        retina_masks: bool = False,
+        tracker: str = DEFAULT_TRACKER,
+        tracker_config: str | Path | dict | None = None,
+        frame_rate: int = 30,
+    ) -> list[Results] | Iterator[Results]:
+        target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
+        resolved_max_det = int(max_det or self.metadata.max_det)
+        if is_live_source(source) and not stream and not is_finite_live_source(source):
+            raise ValueError("Live sources require stream=True or an explicit max_frames limit")
+        LOGGER.debug(
+            "Starting track(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d, tracker=%s)",
+            stream,
+            target_size,
+            conf,
+            iou,
+            resolved_max_det,
+            tracker,
+        )
+        results = self._track_iter(
+            source=source,
+            imgsz=target_size,
+            conf=conf,
+            iou=iou,
+            max_det=resolved_max_det,
+            retina_masks=retina_masks,
+            tracker=tracker,
+            tracker_config=tracker_config,
+            frame_rate=frame_rate,
         )
         if stream:
             return results

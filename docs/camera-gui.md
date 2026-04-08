@@ -22,6 +22,11 @@ The GUI opens a single window that contains:
 - source controls
 - editable label controls
 - a live confidence threshold control
+- a tracking toggle
+- a tracker backend selector (`bytetrack` or `botsort`)
+
+Tracking is enabled by default. When the tracker is active, rendered overlays use instance coloring and display
+track IDs when detections are matched across frames.
 
 ## Source handling
 

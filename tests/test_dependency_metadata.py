@@ -17,12 +17,14 @@ def _load_pyproject() -> dict:
 
 def test_export_and_dev_dependencies_include_onnxscript() -> None:
     data = _load_pyproject()
+    dependencies = data["project"]["dependencies"]
     optional = data["project"]["optional-dependencies"]
 
     export_reqs = optional["export"]
     dev_reqs = optional["dev"]
     all_reqs = optional["all"]
 
+    assert "lap>=0.5.12" in dependencies
     assert any(req.startswith("onnx>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in dev_reqs)

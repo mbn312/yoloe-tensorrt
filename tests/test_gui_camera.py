@@ -19,7 +19,10 @@ def _assert_live_result_contract(result, expected_names: dict[int, str], path_pr
     assert result.names == expected_names
     assert result.boxes is not None
     assert result.boxes.data.ndim == 2
-    assert result.boxes.data.shape[1] == 6
+    assert result.boxes.data.shape[1] in {6, 7}
+    if result.boxes.data.shape[1] == 7:
+        assert result.boxes.is_track
+        assert result.boxes.id is not None
     if result.masks is not None:
         assert tuple(result.masks.orig_shape) == tuple(result.orig_shape)
         assert result.masks.data.shape[0] == result.boxes.data.shape[0]

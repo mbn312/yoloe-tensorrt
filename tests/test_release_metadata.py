@@ -10,6 +10,8 @@ from yoloe_tensorrt.release_metadata import (
     verify_release_metadata,
 )
 
+CURRENT_VERSION = load_project_version("pyproject.toml")
+
 
 def test_normalize_expected_version_accepts_tags_and_refs() -> None:
     assert normalize_expected_version("v0.1.0") == "0.1.0"
@@ -18,11 +20,11 @@ def test_normalize_expected_version_accepts_tags_and_refs() -> None:
 
 
 def test_load_project_version_reads_current_pyproject() -> None:
-    assert load_project_version("pyproject.toml") == "0.1.0"
+    assert load_project_version("pyproject.toml") == CURRENT_VERSION
 
 
 def test_changelog_has_version_matches_current_release() -> None:
-    assert changelog_has_version("CHANGELOG.md", "0.1.0")
+    assert changelog_has_version("CHANGELOG.md", CURRENT_VERSION)
 
 
 def test_verify_release_metadata_checks_expected_version(tmp_path: Path) -> None:

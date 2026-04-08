@@ -19,6 +19,26 @@ results = engine.predict("tests/assets/images/bus.jpg")
 print(results[0].names)
 ```
 
+## Track objects across frames
+
+```python
+from yoloe_tensorrt import YOLOEEngine
+
+engine = YOLOEEngine.from_engine("outputs/artifacts/yoloe26s")
+engine.set_classes(["bus"])
+results = list(engine.track(["tests/assets/images/bus.jpg"] * 2, stream=True))
+print(results[0].boxes.id, results[1].boxes.id)
+```
+
+For frame-by-frame application loops, keep tracking state in a session:
+
+```python
+tracker = engine.create_tracker(tracker="bytetrack", frame_rate=30)
+first = tracker.update("tests/assets/images/bus.jpg")
+second = tracker.update("tests/assets/images/bus.jpg")
+print(first.boxes.id, second.boxes.id)
+```
+
 ## Launch the camera GUI
 
 ```bash
@@ -30,5 +50,7 @@ The GUI lets you change:
 - the video source
 - the active runtime labels
 - the confidence threshold
+- whether tracking is enabled
+- the tracker backend (`bytetrack` or `botsort`)
 
 All from the same window while the stream is running.

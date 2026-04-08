@@ -3,6 +3,7 @@ from ._version import __version__
 __all__ = [
     "__version__",
     "YOLOEEngine",
+    "YOLOETrackerSession",
     "export_model",
     "configure_logging",
     "GStreamerSource",
@@ -24,6 +25,10 @@ def __getattr__(name: str):
         from .export import export_model
 
         return export_model
+    if name == "YOLOETrackerSession":
+        from .tracking import YOLOETrackerSession
+
+        return YOLOETrackerSession
     if name == "configure_logging":
         from .logging_utils import configure_logging
 

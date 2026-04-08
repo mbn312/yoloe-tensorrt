@@ -31,6 +31,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+  "lap>=0.5.12",
   "numpy<2",
   "torch>=2.3",
   "ultralytics>=8.4.30",

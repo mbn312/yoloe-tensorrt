@@ -15,6 +15,7 @@ from .assets import default_example_model_spec, resolve_model_checkpoint
 from .gstreamer import camera_source_from_spec
 from .logging_utils import configure_logging, get_logger
 from .preprocess import normalize_imgsz
+from .tracking import AVAILABLE_TRACKERS, DEFAULT_TRACKER, normalize_tracker_name
 
 if TYPE_CHECKING:
     from .engine import YOLOEEngine
@@ -36,6 +37,8 @@ DEFAULT_GUI_CAMERA_TIMEOUT_S = float(os.environ.get("YOLOE_TRT_GUI_CAMERA_TIMEOU
 DEFAULT_GUI_PREFIX = "camera"
 DEFAULT_GUI_CONF = 0.1
 DEFAULT_GUI_WORKSPACE_BYTES = int(os.environ.get("YOLOE_TRT_GUI_WORKSPACE_BYTES", str(512 << 20)))
+DEFAULT_GUI_TRACKING = os.environ.get("YOLOE_TRT_GUI_TRACKING", "1").lower() not in {"0", "false", "no"}
+DEFAULT_GUI_TRACKER = normalize_tracker_name(os.environ.get("YOLOE_TRT_GUI_TRACKER", DEFAULT_TRACKER))
 
 
 def parse_label_text(text: str) -> list[str]:
@@ -126,13 +129,31 @@ def load_or_build_gui_engine(
     return YOLOEEngine.from_engine(resolved_artifact_dir, device=device)
 
 
-def _overlay_gui_text(frame, source_spec: str, labels: list[str], confidence: float, result) -> None:
+def _overlay_gui_text(
+    frame,
+    source_spec: str,
+    labels: list[str],
+    confidence: float,
+    result,
+    *,
+    tracking_enabled: bool,
+    tracker_name: str,
+) -> None:
     lines = [
         f"source: {source_spec}",
         f"labels: {', '.join(labels)}",
         f"conf: {confidence:.2f}",
+        f"tracking: {'on' if tracking_enabled else 'off'} ({tracker_name})",
         "controls: edit source/labels on the left, close window to quit",
     ]
+    if (
+        tracking_enabled
+        and result.boxes is not None
+        and getattr(result.boxes, "is_track", False)
+        and result.boxes.id is not None
+    ):
+        track_count = int(result.boxes.id.numel()) if hasattr(result.boxes.id, "numel") else int(len(result.boxes.id))
+        lines.append(f"tracks: {track_count}")
     if getattr(result, "speed", None):
         lines.append("speed ms: pre={preprocess:.1f} inf={inference:.1f} post={postprocess:.1f}".format(**result.speed))
 
@@ -144,7 +165,15 @@ def _overlay_gui_text(frame, source_spec: str, labels: list[str], confidence: fl
 
 
 class CameraGuiWindow:
-    def __init__(self, title: str, source_spec: str, labels: list[str], confidence: float) -> None:
+    def __init__(
+        self,
+        title: str,
+        source_spec: str,
+        labels: list[str],
+        confidence: float,
+        tracking_enabled: bool,
+        tracker_name: str,
+    ) -> None:
         self._root = tk.Tk()
         self._root.title(title)
         self._root.resizable(True, True)
@@ -154,8 +183,10 @@ class CameraGuiWindow:
         self._label_input_var = tk.StringVar(value="")
         self._confidence_var = tk.DoubleVar(value=float(confidence))
         self._confidence_text_var = tk.StringVar(value=f"{float(confidence):.2f}")
+        self._tracking_enabled_var = tk.BooleanVar(value=bool(tracking_enabled))
+        self._tracker_var = tk.StringVar(value=normalize_tracker_name(tracker_name))
         self._status_var = tk.StringVar(value="Edit the source and labels, then press Apply")
-        self._pending_update: tuple[str, list[str]] | None = None
+        self._pending_update: tuple[str, list[str], bool, str] | None = None
         self._closed = False
         self._photo: ImageTk.PhotoImage | None = None
 
@@ -224,14 +255,23 @@ class CameraGuiWindow:
             row=0, column=1, sticky="w", padx=(8, 0)
         )
 
+        tracking_row = tk.Frame(controls)
+        tracking_row.grid(row=11, column=0, sticky="ew", pady=(8, 4))
+        tracking_row.columnconfigure(0, weight=1)
+        tracking_row.columnconfigure(1, weight=1)
+        tk.Checkbutton(tracking_row, text="Enable Tracking", variable=self._tracking_enabled_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        tk.OptionMenu(tracking_row, self._tracker_var, *AVAILABLE_TRACKERS).grid(row=0, column=1, sticky="ew")
+
         tk.Label(
             controls,
             text="Use commas or new lines to add multiple labels at once.",
             anchor="w",
             justify="left",
-        ).grid(row=11, column=0, sticky="ew", pady=(8, 0))
+        ).grid(row=12, column=0, sticky="ew", pady=(8, 0))
         tk.Label(controls, textvariable=self._status_var, anchor="w", justify="left", wraplength=320).grid(
-            row=12, column=0, sticky="ew", pady=(8, 0)
+            row=13, column=0, sticky="ew", pady=(8, 0)
         )
 
         self._video_label = tk.Label(root_frame, text="Waiting for frames...", anchor="center")
@@ -310,8 +350,13 @@ class CameraGuiWindow:
         if not labels:
             self._status_var.set("Add at least one label before applying")
             return
-        self._pending_update = (source, labels)
-        self._status_var.set("Queued source/label update; confidence changes already apply live")
+        self._pending_update = (
+            source,
+            labels,
+            bool(self._tracking_enabled_var.get()),
+            normalize_tracker_name(self._tracker_var.get()),
+        )
+        self._status_var.set("Queued source/label/tracker update; confidence changes already apply live")
 
     def pump(self) -> None:
         if self._closed:
@@ -322,7 +367,7 @@ class CameraGuiWindow:
         except tk.TclError:
             self._closed = True
 
-    def take_pending_update(self) -> tuple[str, list[str]] | None:
+    def take_pending_update(self) -> tuple[str, list[str], bool, str] | None:
         update = self._pending_update
         self._pending_update = None
         return update
@@ -333,11 +378,30 @@ class CameraGuiWindow:
     def confidence(self) -> float:
         return float(self._confidence_var.get())
 
-    def mark_applied(self, source: str, labels: list[str], message: str | None = None) -> None:
+    def tracking_enabled(self) -> bool:
+        return bool(self._tracking_enabled_var.get())
+
+    def tracker_name(self) -> str:
+        return normalize_tracker_name(self._tracker_var.get())
+
+    def mark_applied(
+        self,
+        source: str,
+        labels: list[str],
+        tracking_enabled: bool,
+        tracker_name: str,
+        message: str | None = None,
+    ) -> None:
         self._source_var.set(source)
         self._set_label_list(labels)
+        self._tracking_enabled_var.set(bool(tracking_enabled))
+        self._tracker_var.set(normalize_tracker_name(tracker_name))
         self._status_var.set(
-            message or f"Active source updated; labels={', '.join(labels)} conf={self.confidence():.2f}"
+            message
+            or (
+                f"Active source updated; labels={', '.join(labels)} conf={self.confidence():.2f} "
+                f"tracking={'on' if tracking_enabled else 'off'} backend={tracker_name}"
+            )
         )
 
     def show_frame(self, frame_bgr) -> None:
@@ -368,6 +432,8 @@ def run_camera_gui(
     iou: float = 0.45,
     max_det: int | None = None,
     retina_masks: bool = False,
+    tracking: bool = DEFAULT_GUI_TRACKING,
+    tracker: str = DEFAULT_GUI_TRACKER,
     make_source: Callable[..., object] | None = None,
     on_result: Callable[[object, str, list[str]], None] | None = None,
 ) -> int:
@@ -375,6 +441,8 @@ def run_camera_gui(
     resolved_max_det = int(max_det or engine.metadata.max_det)
     active_source_spec = str(source_spec)
     active_labels = list(labels)
+    active_tracking = bool(tracking)
+    active_tracker = normalize_tracker_name(tracker)
     if not active_labels:
         raise ValueError("labels must contain at least one class name")
 
@@ -395,18 +463,38 @@ def run_camera_gui(
 
     engine.clear_prompts()
     engine.set_classes(active_labels)
-    gui_window = CameraGuiWindow(window_title, active_source_spec, active_labels, confidence=conf)
+    gui_window = CameraGuiWindow(
+        window_title,
+        active_source_spec,
+        active_labels,
+        confidence=conf,
+        tracking_enabled=active_tracking,
+        tracker_name=active_tracker,
+    )
     displayed_frames = 0
     current_source = None
+    tracker_session = engine.create_tracker(tracker=active_tracker, frame_rate=fps) if active_tracking else None
 
-    def _apply_update(new_source_spec: str, new_labels: list[str]) -> bool:
-        nonlocal active_labels, active_source_spec, current_source
+    def _apply_update(
+        new_source_spec: str,
+        new_labels: list[str],
+        new_tracking_enabled: bool,
+        new_tracker_name: str,
+    ) -> bool:
+        nonlocal active_labels, active_source_spec, active_tracking, active_tracker, current_source, tracker_session
 
         labels_changed = new_labels != active_labels
+        tracking_changed = bool(new_tracking_enabled) != active_tracking
+        tracker_changed = normalize_tracker_name(new_tracker_name) != active_tracker
         if labels_changed:
             engine.clear_prompts()
             engine.set_classes(new_labels)
             active_labels = new_labels
+
+        if tracking_changed or tracker_changed or labels_changed:
+            active_tracking = bool(new_tracking_enabled)
+            active_tracker = normalize_tracker_name(new_tracker_name)
+            tracker_session = engine.create_tracker(tracker=active_tracker, frame_rate=fps) if active_tracking else None
 
         if new_source_spec != active_source_spec:
             try:
@@ -422,6 +510,8 @@ def run_camera_gui(
                     gui_window.mark_applied(
                         active_source_spec,
                         active_labels,
+                        active_tracking,
+                        active_tracker,
                         message=f"Applied labels; {message}",
                     )
                 else:
@@ -430,11 +520,13 @@ def run_camera_gui(
 
             active_source_spec = new_source_spec
             current_source = next_source
-            gui_window.mark_applied(active_source_spec, active_labels)
+            if tracker_session is not None:
+                tracker_session.reset()
+            gui_window.mark_applied(active_source_spec, active_labels, active_tracking, active_tracker)
             return True
 
-        if labels_changed:
-            gui_window.mark_applied(active_source_spec, active_labels)
+        if labels_changed or tracking_changed or tracker_changed:
+            gui_window.mark_applied(active_source_spec, active_labels, active_tracking, active_tracker)
         else:
             gui_window.set_status("No changes to apply")
         return False
@@ -442,7 +534,7 @@ def run_camera_gui(
     try:
         try:
             current_source = make_source(active_source_spec, prefix=source_prefix, max_frames=max_frames)
-            gui_window.mark_applied(active_source_spec, active_labels)
+            gui_window.mark_applied(active_source_spec, active_labels, active_tracking, active_tracker)
         except Exception as exc:
             LOGGER.warning("Unable to open initial GUI source '%s': %s", active_source_spec, exc)
             gui_window.set_status(f"Unable to open source '{active_source_spec}': {exc}")
@@ -476,18 +568,36 @@ def run_camera_gui(
                         break
 
                     active_conf = gui_window.confidence()
-                    result = engine.predict_item(
-                        item=item,
-                        imgsz=target_size,
-                        conf=active_conf,
-                        iou=iou,
-                        max_det=resolved_max_det,
-                        retina_masks=retina_masks,
-                    )
+                    if tracker_session is not None:
+                        result = tracker_session.update(
+                            item,
+                            imgsz=target_size,
+                            conf=active_conf,
+                            iou=iou,
+                            max_det=resolved_max_det,
+                            retina_masks=retina_masks,
+                        )
+                    else:
+                        result = engine.predict_item(
+                            item=item,
+                            imgsz=target_size,
+                            conf=active_conf,
+                            iou=iou,
+                            max_det=resolved_max_det,
+                            retina_masks=retina_masks,
+                        )
                     if on_result is not None:
                         on_result(result, active_source_spec, list(active_labels))
-                    frame = result.plot()
-                    _overlay_gui_text(frame, active_source_spec, active_labels, active_conf, result)
+                    frame = result.plot(color_mode="instance" if tracker_session is not None else "class")
+                    _overlay_gui_text(
+                        frame,
+                        active_source_spec,
+                        active_labels,
+                        active_conf,
+                        result,
+                        tracking_enabled=tracker_session is not None,
+                        tracker_name=active_tracker,
+                    )
                     gui_window.show_frame(frame)
                     displayed_frames += 1
 
@@ -540,6 +650,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Initial detection confidence threshold. The GUI can change it live.",
     )
     parser.add_argument(
+        "--track",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_GUI_TRACKING,
+        help="Enable object tracking in the GUI. Enabled by default.",
+    )
+    parser.add_argument(
+        "--tracker",
+        choices=AVAILABLE_TRACKERS,
+        default=DEFAULT_GUI_TRACKER,
+        help="Tracker backend to use when tracking is enabled.",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.environ.get("YOLOE_TRT_LOG_LEVEL", "INFO"),
         help="Logging level for the launcher.",
@@ -554,11 +676,14 @@ def main(argv: list[str] | None = None) -> int:
 
     labels = list(args.labels) if args.labels else list(DEFAULT_GUI_LABELS)
     confidence = parse_confidence_text(args.conf, fallback=float(DEFAULT_GUI_CONF))
+    tracker_name = normalize_tracker_name(args.tracker)
     LOGGER.info(
-        "Launching YOLOE camera GUI with source='%s', labels=%s, conf=%.2f, artifact_dir='%s'",
+        "Launching YOLOE camera GUI with source='%s', labels=%s, conf=%.2f, tracking=%s, tracker=%s, artifact_dir='%s'",
         args.source,
         labels,
         confidence,
+        bool(args.track),
+        tracker_name,
         args.artifact_dir,
     )
     engine = load_or_build_gui_engine(
@@ -576,6 +701,8 @@ def main(argv: list[str] | None = None) -> int:
         max_frames=None if int(args.max_frames) <= 0 else int(args.max_frames),
         imgsz=int(args.imgsz),
         conf=confidence,
+        tracking=bool(args.track),
+        tracker=tracker_name,
     )
     LOGGER.info("Camera GUI closed after displaying %d frame(s)", displayed_frames)
     return 0

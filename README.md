@@ -6,6 +6,7 @@
 
 - Runtime text labels without rebuilding the main TensorRT engine
 - Optional visual prompts for YOLOE detection and segmentation models
+- Stateful object tracking with ByteTrack or BoT-SORT on top of YOLOE results
 - Native C++ TensorRT main-engine runtime with GPU output handoff back to Python
 - Python package API, export CLI, and live camera GUI
 - Jetson-first deployment model with Linux x86_64 CUDA/TensorRT also supported
@@ -117,6 +118,17 @@ results = engine.predict("tests/assets/images/bus.jpg")
 print(results[0].boxes.data.shape[0], results[0].names)
 ```
 
+Track objects across frames:
+
+```python
+from yoloe_tensorrt import YOLOEEngine
+
+engine = YOLOEEngine.from_engine("outputs/artifacts/yoloe26s")
+engine.set_classes(["bus"])
+results = list(engine.track(["tests/assets/images/bus.jpg"] * 2, stream=True))
+print(results[0].boxes.id, results[1].boxes.id)
+```
+
 Launch the live camera GUI:
 
 ```bash
@@ -155,6 +167,7 @@ GitHub Actions is the supported automation path for this repository.
 
 - The main inference engine path is native C++/TensorRT.
 - Prompt compilation, visual prompt orchestration, and Ultralytics `Results` wrapping still live in Python.
+- Tracking is stateful and currently runs in Python on top of the detection/segmentation results.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
 - Live USB camera input is available through a GStreamer appsink pipeline. Jetson zero-copy camera ingest is still on the roadmap.
 - If you do not have a camera attached, use `videotest://<pattern>` such as `videotest://ball` or `videotest://smpte`.
