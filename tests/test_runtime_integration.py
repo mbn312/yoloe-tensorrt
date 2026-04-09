@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from torch.utils.dlpack import from_dlpack
 from yoloe_tensorrt import GStreamerSource, PreparedTensorInput, YOLOEEngine
+from yoloe_tensorrt.source import SourceItem, normalize_source
 
 TEST_CONF = 0.1
 
@@ -130,6 +132,47 @@ def test_engine_predict_uses_fast_prepared_tensor_path_by_default(
     _assert_result_contract(result, image_path, _expected_names(labels))
     assert result.speed["preprocess"] == pytest.approx(0.0)
     assert result.boxes.data.shape[0] >= 1
+
+
+@pytest.mark.integration
+def test_native_preprocess_matches_python_reference_for_real_image(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    native_runtime = runtime_engine.native_main_runtime
+    assert native_runtime is not None
+
+    image_path = test_images["bus"]
+    item = normalize_source(image_path, default_prefix="frame")[0]
+    prepared = runtime_engine.prepare_cuda_input(item)
+    native_outputs = native_runtime._preprocess_image_to_tensor(
+        item.image,
+        int(prepared.tensor.shape[2]),
+        int(prepared.tensor.shape[3]),
+    )
+    native_tensor = from_dlpack(native_outputs["tensor"])
+
+    assert native_tensor.shape == prepared.tensor.shape
+    assert native_tensor.dtype == prepared.tensor.dtype
+    assert torch.allclose(native_tensor.float(), prepared.tensor.float(), atol=5e-3, rtol=1e-3)
+
+
+@pytest.mark.integration
+def test_native_preprocess_matches_python_reference_for_padded_image(
+    runtime_engine: YOLOEEngine,
+) -> None:
+    native_runtime = runtime_engine.native_main_runtime
+    assert native_runtime is not None
+
+    item = SourceItem(image=np.full((48, 96, 3), 127, dtype=np.uint8), path="synthetic.png")
+    prepared = runtime_engine.prepare_cuda_input(item, imgsz=(320, 320))
+    native_outputs = native_runtime._preprocess_image_to_tensor(item.image, 320, 320)
+    native_tensor = from_dlpack(native_outputs["tensor"])
+
+    assert native_tensor.shape == prepared.tensor.shape
+    assert native_tensor.dtype == prepared.tensor.dtype
+    assert torch.allclose(native_tensor.float(), prepared.tensor.float(), atol=5e-3, rtol=1e-3)
+    assert float(native_tensor[0, 0, 0, 0].float().item()) == pytest.approx(114.0 / 255.0, abs=5e-3)
 
 
 @pytest.mark.integration

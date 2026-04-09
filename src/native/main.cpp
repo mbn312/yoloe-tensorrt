@@ -4,9 +4,13 @@
 #include <cuda_runtime_api.h>
 #include <NvInferRuntime.h>
 #include <opencv2/imgproc.hpp>
+#include "preprocess_kernels.h"
+
+#if defined(YOLOE_TRT_ENABLE_JETSON_CAMERA) && !defined(YOLOE_TRT_ENABLE_CUDA_PREPROCESS)
+#error "Jetson zero-copy camera backend requires YOLOE_TRT_ENABLE_CUDA_PREPROCESS"
+#endif
 
 #ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
-#include "jetson_camera_kernels.h"
 
 #include <EGL/egl.h>
 #include <cuda.h>
@@ -57,6 +61,44 @@ inline void throw_if_cuda_failed(cudaError_t status, char const* message)
         throw std::runtime_error(std::string(message) + ": " + cudaGetErrorString(status));
     }
 }
+
+class CudaEventHandle {
+public:
+    CudaEventHandle() = default;
+
+    ~CudaEventHandle()
+    {
+        if (event_ != nullptr) {
+            cudaEventDestroy(event_);
+            event_ = nullptr;
+        }
+    }
+
+    CudaEventHandle(CudaEventHandle const&) = delete;
+    CudaEventHandle& operator=(CudaEventHandle const&) = delete;
+
+    void create(char const* create_message, unsigned int flags = cudaEventDefault)
+    {
+        if (event_ != nullptr) {
+            cudaEventDestroy(event_);
+            event_ = nullptr;
+        }
+        throw_if_cuda_failed(cudaEventCreateWithFlags(&event_, flags), create_message);
+    }
+
+    operator cudaEvent_t() const
+    {
+        return event_;
+    }
+
+    bool valid() const
+    {
+        return event_ != nullptr;
+    }
+
+private:
+    cudaEvent_t event_ = nullptr;
+};
 
 struct TrtDeleter {
     template <typename T>
@@ -479,6 +521,11 @@ public:
     {
         throw_if_cuda_failed(cudaSetDevice(device_id_), "cudaSetDevice failed");
         throw_if_cuda_failed(cudaStreamCreate(&stream_), "cudaStreamCreate failed");
+        preprocess_start_event_.create("cudaEventCreate failed for preprocess start");
+        preprocess_end_event_.create("cudaEventCreate failed for preprocess end");
+        inference_start_event_.create("cudaEventCreate failed for inference start");
+        inference_end_event_.create("cudaEventCreate failed for inference end");
+        producer_handoff_event_.create("cudaEventCreate failed for prepared tensor handoff", cudaEventDisableTiming);
 
         py::gil_scoped_release release;
 
@@ -528,8 +575,11 @@ public:
         }
     }
 
-    ~NativeMainRuntime()
+    ~NativeMainRuntime() noexcept
     {
+        if (device_id_ >= 0) {
+            cudaSetDevice(device_id_);
+        }
         if (stream_ != nullptr) {
             cudaStreamDestroy(stream_);
             stream_ = nullptr;
@@ -554,6 +604,7 @@ public:
 
     void set_prompt_embeddings(py::array prompt_embeddings_py)
     {
+        activate_device("cudaSetDevice failed before prompt upload");
         auto prompt_embeddings = py::array_t<float, py::array::c_style | py::array::forcecast>(prompt_embeddings_py);
         auto const info = prompt_embeddings.request();
         if (info.ndim != 2 && info.ndim != 3) {
@@ -617,15 +668,38 @@ public:
             throw std::runtime_error("image must have shape (H, W, 3)");
         }
 
-        auto const preprocess_start = Clock::now();
+        activate_device("cudaSetDevice failed before host image inference");
         preprocess_host_image(image, target_h, target_w);
-        auto const preprocess_ms = std::chrono::duration<double, std::milli>(Clock::now() - preprocess_start).count();
-
-        auto const inference_start = Clock::now();
-        execute(image_buffer_.data(), target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
-        auto const inference_ms = std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
+        auto const inference_ms = execute(image_buffer_.data(), target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
+        auto const preprocess_ms = resolve_preprocess_ms();
 
         return build_output_dict(target_h, target_w, preprocess_ms, inference_ms);
+    }
+
+    py::dict _preprocess_image_to_tensor(py::array image_py, int target_h, int target_w)
+    {
+        auto image = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>(image_py);
+        auto const info = image.request();
+        if (info.ndim != 3 || info.shape[2] != 3) {
+            throw std::runtime_error("image must have shape (H, W, 3)");
+        }
+
+        activate_device("cudaSetDevice failed before internal preprocess hook");
+        preprocess_host_image(image, target_h, target_w);
+        throw_if_cuda_failed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed after internal preprocess hook");
+        auto const preprocess_ms = resolve_preprocess_ms();
+
+        py::dict outputs;
+        outputs[py::str("tensor")] = py::cast(
+            CudaTensorView(
+                shared_from_this(),
+                image_buffer_.data(),
+                std::vector<std::int64_t>{ 1, 3, target_h, target_w },
+                image_binding_.dtype,
+                device_id_));
+        outputs[py::str("input_shape")] = py::make_tuple(target_h, target_w);
+        outputs[py::str("preprocess_ms")] = preprocess_ms;
+        return outputs;
     }
 
     py::dict infer_tensor(std::uintptr_t image_ptr_value, int target_h, int target_w, std::uintptr_t producer_stream_value = 0)
@@ -639,10 +713,9 @@ public:
 
         auto* image_ptr = reinterpret_cast<void*>(image_ptr_value);
         auto* producer_stream = reinterpret_cast<cudaStream_t>(producer_stream_value);
+        activate_device("cudaSetDevice failed before prepared tensor inference");
         wait_for_producer_stream(producer_stream);
-        auto const inference_start = Clock::now();
-        execute(image_ptr, target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
-        auto const inference_ms = std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
+        auto const inference_ms = execute(image_ptr, target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
 
         return build_output_dict(target_h, target_w, 0.0, inference_ms);
     }
@@ -652,6 +725,8 @@ public:
         if (runs < 1) {
             runs = 1;
         }
+
+        activate_device("cudaSetDevice failed before warmup");
 
         CudaBuffer warm_prompt_buffer;
         void* prompt_ptr = prompt_buffer_.data();
@@ -672,35 +747,46 @@ public:
         throw_if_cuda_failed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed before warmup");
 
         for (int i = 0; i < runs; ++i) {
-            execute(image_buffer_.data(), target_h, target_w, prompt_ptr, prompt_count_to_use);
+            static_cast<void>(execute(image_buffer_.data(), target_h, target_w, prompt_ptr, prompt_count_to_use));
         }
     }
 
 private:
+    void activate_device(char const* message)
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id_), message);
+    }
+
+    double elapsed_event_ms(cudaEvent_t start_event, cudaEvent_t end_event, char const* context) const
+    {
+        float elapsed_ms = 0.0f;
+        throw_if_cuda_failed(
+            cudaEventElapsedTime(&elapsed_ms, start_event, end_event),
+            (std::string(context) + ": cudaEventElapsedTime failed").c_str());
+        return static_cast<double>(elapsed_ms);
+    }
+
+    double resolve_preprocess_ms()
+    {
+#ifdef YOLOE_TRT_ENABLE_CUDA_PREPROCESS
+        return elapsed_event_ms(preprocess_start_event_, preprocess_end_event_, "host image preprocess");
+#else
+        return last_preprocess_cpu_ms_ + elapsed_event_ms(preprocess_start_event_, preprocess_end_event_, "host image upload");
+#endif
+    }
+
     void wait_for_producer_stream(cudaStream_t producer_stream)
     {
         if (producer_stream == nullptr || producer_stream == stream_) {
             return;
         }
 
-        cudaEvent_t ready_event = nullptr;
         throw_if_cuda_failed(
-            cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming),
-            "cudaEventCreateWithFlags failed for prepared tensor handoff");
-
-        try {
-            throw_if_cuda_failed(
-                cudaEventRecord(ready_event, producer_stream),
-                "cudaEventRecord failed for prepared tensor handoff");
-            throw_if_cuda_failed(
-                cudaStreamWaitEvent(stream_, ready_event, 0),
-                "cudaStreamWaitEvent failed for prepared tensor handoff");
-        } catch (...) {
-            cudaEventDestroy(ready_event);
-            throw;
-        }
-
-        throw_if_cuda_failed(cudaEventDestroy(ready_event), "cudaEventDestroy failed for prepared tensor handoff");
+            cudaEventRecord(producer_handoff_event_, producer_stream),
+            "cudaEventRecord failed for prepared tensor handoff");
+        throw_if_cuda_failed(
+            cudaStreamWaitEvent(stream_, producer_handoff_event_, 0),
+            "cudaStreamWaitEvent failed for prepared tensor handoff");
     }
 
     py::dict build_output_dict(int target_h, int target_w, double preprocess_ms, double inference_ms)
@@ -759,15 +845,45 @@ private:
         auto const orig_h = static_cast<int>(info.shape[0]);
         auto const orig_w = static_cast<int>(info.shape[1]);
 
+#ifdef YOLOE_TRT_ENABLE_CUDA_PREPROCESS
+        auto const input_bytes = static_cast<std::size_t>(orig_h) * static_cast<std::size_t>(info.strides[0]);
+        auto const plane_elements = static_cast<std::size_t>(target_h) * static_cast<std::size_t>(target_w) * 3U;
+        image_upload_buffer_.ensure(input_bytes);
+        image_buffer_.ensure(plane_elements * dtype_size(image_binding_.dtype));
+        throw_if_cuda_failed(
+            cudaEventRecord(preprocess_start_event_, stream_),
+            "cudaEventRecord failed for host image preprocess start");
+        throw_if_cuda_failed(
+            cudaMemcpyAsync(
+                image_upload_buffer_.data(),
+                info.ptr,
+                input_bytes,
+                cudaMemcpyHostToDevice,
+                stream_),
+            "cudaMemcpyAsync for raw image upload failed");
+        launch_cuda_preprocess(
+            image_upload_buffer_.data(),
+            orig_w,
+            orig_h,
+            static_cast<int>(info.strides[0]),
+            CudaPreprocessInputFormat::kBGR,
+            target_w,
+            target_h,
+            fp16_,
+            image_buffer_.data(),
+            stream_);
+        throw_if_cuda_failed(cudaGetLastError(), "CUDA preprocess kernel launch failed for host image");
+        throw_if_cuda_failed(
+            cudaEventRecord(preprocess_end_event_, stream_),
+            "cudaEventRecord failed for host image preprocess end");
+#else
+        auto const preprocess_start = Clock::now();
         cv::Mat const src(orig_h, orig_w, CV_8UC3, const_cast<void*>(info.ptr));
-
-        double const gain = std::min(static_cast<double>(target_h) / static_cast<double>(orig_h), static_cast<double>(target_w) / static_cast<double>(orig_w));
-        auto const resized_h = std::max(1, static_cast<int>(std::round(static_cast<double>(orig_h) * gain)));
-        auto const resized_w = std::max(1, static_cast<int>(std::round(static_cast<double>(orig_w) * gain)));
-        auto const pad_h = target_h - resized_h;
-        auto const pad_w = target_w - resized_w;
-        auto const top = pad_h / 2;
-        auto const left = pad_w / 2;
+        auto const geometry = compute_letterbox_geometry(orig_w, orig_h, target_w, target_h);
+        auto const resized_h = geometry.resized_height;
+        auto const resized_w = geometry.resized_width;
+        auto const top = geometry.pad_top;
+        auto const left = geometry.pad_left;
 
         cv::Mat resized;
         cv::resize(src, resized, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_LINEAR);
@@ -800,6 +916,9 @@ private:
             }
             image_buffer_.ensure(host_image_half_.size() * sizeof(__half));
             throw_if_cuda_failed(
+                cudaEventRecord(preprocess_start_event_, stream_),
+                "cudaEventRecord failed for host image upload start");
+            throw_if_cuda_failed(
                 cudaMemcpyAsync(
                     image_buffer_.data(),
                     host_image_half_.data(),
@@ -810,6 +929,9 @@ private:
         } else {
             image_buffer_.ensure(host_image_float_.size() * sizeof(float));
             throw_if_cuda_failed(
+                cudaEventRecord(preprocess_start_event_, stream_),
+                "cudaEventRecord failed for host image upload start");
+            throw_if_cuda_failed(
                 cudaMemcpyAsync(
                     image_buffer_.data(),
                     host_image_float_.data(),
@@ -818,6 +940,11 @@ private:
                     stream_),
                 "cudaMemcpyAsync for image upload failed");
         }
+        throw_if_cuda_failed(
+            cudaEventRecord(preprocess_end_event_, stream_),
+            "cudaEventRecord failed for host image upload end");
+        last_preprocess_cpu_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - preprocess_start).count();
+#endif
     }
 
     void set_input_dimensions(int target_h, int target_w, int prompt_count)
@@ -861,11 +988,10 @@ private:
         }
     }
 
-    void execute(void* image_ptr, int target_h, int target_w, void* prompt_ptr, int prompt_count)
+    double execute(void* image_ptr, int target_h, int target_w, void* prompt_ptr, int prompt_count)
     {
         py::gil_scoped_release release;
 
-        throw_if_cuda_failed(cudaSetDevice(device_id_), "cudaSetDevice failed");
         set_input_dimensions(target_h, target_w, prompt_count);
         ensure_output_buffers();
 
@@ -883,10 +1009,17 @@ private:
             }
         }
 
+        throw_if_cuda_failed(
+            cudaEventRecord(inference_start_event_, stream_),
+            "cudaEventRecord failed for TensorRT inference start");
         if (!context_->enqueueV3(stream_)) {
             throw std::runtime_error("TensorRT enqueueV3 failed");
         }
+        throw_if_cuda_failed(
+            cudaEventRecord(inference_end_event_, stream_),
+            "cudaEventRecord failed for TensorRT inference end");
         throw_if_cuda_failed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed after inference");
+        return elapsed_event_ms(inference_start_event_, inference_end_event_, "TensorRT inference");
     }
 
     std::string engine_path_;
@@ -913,15 +1046,24 @@ private:
     int prompt_embed_dim_ = 0;
     bool has_prompt_embeddings_ = false;
     int current_prompt_count_ = 0;
+    double last_preprocess_cpu_ms_ = 0.0;
 
     CudaBuffer image_buffer_;
+    CudaBuffer image_upload_buffer_;
     CudaBuffer prompt_buffer_;
     std::vector<CudaBuffer> output_buffers_;
     std::vector<std::vector<std::int64_t>> output_shapes_;
 
+#ifndef YOLOE_TRT_ENABLE_CUDA_PREPROCESS
     std::vector<float> host_image_float_;
     std::vector<__half> host_image_half_;
+#endif
     std::vector<__half> prompt_half_host_;
+    CudaEventHandle preprocess_start_event_;
+    CudaEventHandle preprocess_end_event_;
+    CudaEventHandle inference_start_event_;
+    CudaEventHandle inference_end_event_;
+    CudaEventHandle producer_handoff_event_;
 };
 
 #ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
@@ -1258,14 +1400,14 @@ private:
 
             auto const plane_elements = static_cast<std::size_t>(target_h_) * static_cast<std::size_t>(target_w_) * 3U;
             auto pending_frame = acquire_frame_slot(plane_elements * dtype_size(output_dtype_));
-            launch_jetson_zero_copy_preprocess(
+            launch_cuda_preprocess(
                 egl_frame.frame.pPitch[0],
                 width,
                 height,
                 static_cast<int>(egl_frame.pitch),
+                input_is_bgrx ? CudaPreprocessInputFormat::kBGRX : CudaPreprocessInputFormat::kRGBA,
                 target_w_,
                 target_h_,
-                input_is_bgrx,
                 fp16_,
                 pending_frame->output_buffer.data(),
                 stream_);
@@ -1365,6 +1507,12 @@ PYBIND11_MODULE(_native, m)
         .def("clear_prompt_embeddings", &NativeMainRuntime::clear_prompt_embeddings)
         .def("set_prompt_embeddings", &NativeMainRuntime::set_prompt_embeddings, py::arg("prompt_embeddings"))
         .def("infer_image", &NativeMainRuntime::infer_image, py::arg("image"), py::arg("target_h"), py::arg("target_w"))
+        .def(
+            "_preprocess_image_to_tensor",
+            &NativeMainRuntime::_preprocess_image_to_tensor,
+            py::arg("image"),
+            py::arg("target_h"),
+            py::arg("target_w"))
         .def(
             "infer_tensor",
             &NativeMainRuntime::infer_tensor,
