@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import torch
@@ -394,13 +394,32 @@ class YOLOEEngine:
             imgsz,
         )
         preprocess_start = time.perf_counter()
+        sample = SimpleNamespace(original=item.image, path=item.path)
         if self.native_main_runtime is not None:
-            native_outputs = self.native_main_runtime.infer_image(item.image, imgsz[0], imgsz[1])
-            preprocess_ms = float(native_outputs["preprocess_ms"])
-            inference_ms = float(native_outputs["inference_ms"])
-            outputs = {name: from_dlpack(native_outputs[name]) for name in self._main_output_names}
-            input_shape = tuple(int(v) for v in native_outputs["input_shape"])
-            sample = SimpleNamespace(original=item.image, path=item.path)
+            result = self._run_native_result(
+                sample=sample,
+                names=names,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+                raw_call=lambda: self.native_main_runtime.infer_image(item.image, imgsz[0], imgsz[1]),
+                postprocessed_call=(
+                    lambda: self.native_main_runtime.infer_image_postprocessed(
+                        item.image,
+                        imgsz[0],
+                        imgsz[1],
+                        int(item.image.shape[0]),
+                        int(item.image.shape[1]),
+                        float(conf),
+                        float(iou),
+                        int(max_det),
+                        bool(retina_masks),
+                    )
+                )
+                if hasattr(self.native_main_runtime, "infer_image_postprocessed")
+                else None,
+            )
         else:
             if self.main_runtime is None:
                 raise RuntimeError("Main runtime is not initialized")
@@ -423,30 +442,29 @@ class YOLOEEngine:
             torch.cuda.synchronize(self.device)
             inference_ms = (time.perf_counter() - inference_start) * 1000.0
             input_shape = tuple(int(v) for v in sample.tensor.shape[2:])
-
-        postprocess_start = time.perf_counter()
-        speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
-        result = self._postprocess_predictions(
-            outputs=outputs,
-            sample=sample,
-            input_shape=input_shape,
-            names=names,
-            conf=conf,
-            iou=iou,
-            max_det=max_det,
-            retina_masks=retina_masks,
-            speed=speed,
-        )
-        speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
-        result.speed = speed
+            postprocess_start = time.perf_counter()
+            speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
+            result = self._postprocess_predictions(
+                outputs=outputs,
+                sample=sample,
+                input_shape=input_shape,
+                names=names,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+                speed=speed,
+            )
+            speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
+            result.speed = speed
         detections = int(result.boxes.data.shape[0]) if result.boxes is not None else 0
         LOGGER.debug(
             "Completed inference on '%s': detections=%d preprocess=%.1fms inference=%.1fms postprocess=%.1fms",
             item.path,
             detections,
-            speed["preprocess"],
-            speed["inference"],
-            speed["postprocess"],
+            result.speed["preprocess"],
+            result.speed["inference"],
+            result.speed["postprocess"],
         )
         return result
 
@@ -471,6 +489,93 @@ class YOLOEEngine:
         fallback_path = path or "tensor0"
         fallback_image = np.zeros((input_shape[0], input_shape[1], 3), dtype=np.uint8)
         return SimpleNamespace(original=fallback_image, path=fallback_path)
+
+    def _build_native_postprocessed_result(
+        self,
+        native_outputs: dict[str, object],
+        sample,
+        names: list[str],
+        preprocess_ms: float,
+        inference_ms: float,
+    ) -> Results:
+        speed = {
+            "preprocess": preprocess_ms,
+            "inference": inference_ms,
+            "postprocess": float(native_outputs["postprocess_ms"]),
+        }
+        names_map = {index: name for index, name in enumerate(names)}
+        boxes = from_dlpack(native_outputs["boxes"])
+        masks = from_dlpack(native_outputs["masks"]) if "masks" in native_outputs else None
+        return Results(sample.original, path=sample.path, names=names_map, boxes=boxes, masks=masks, speed=speed)
+
+    def _build_native_legacy_result(
+        self,
+        native_outputs: dict[str, object],
+        sample,
+        names: list[str],
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+        input_shape: tuple[int, int] | None = None,
+    ) -> Results:
+        outputs = {name: from_dlpack(native_outputs[name]) for name in self._main_output_names}
+        resolved_input_shape = (
+            input_shape if input_shape is not None else tuple(int(v) for v in native_outputs["input_shape"])
+        )
+        speed = {
+            "preprocess": float(native_outputs["preprocess_ms"]),
+            "inference": float(native_outputs["inference_ms"]),
+            "postprocess": 0.0,
+        }
+        postprocess_start = time.perf_counter()
+        result = self._postprocess_predictions(
+            outputs=outputs,
+            sample=sample,
+            input_shape=resolved_input_shape,
+            names=names,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            retina_masks=retina_masks,
+            speed=speed,
+        )
+        speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
+        result.speed = speed
+        return result
+
+    def _run_native_result(
+        self,
+        sample,
+        names: list[str],
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+        *,
+        input_shape: tuple[int, int] | None = None,
+        raw_call: Callable[[], dict[str, object]],
+        postprocessed_call: Callable[[], dict[str, object]] | None = None,
+    ) -> Results:
+        if postprocessed_call is not None:
+            native_outputs = postprocessed_call()
+            return self._build_native_postprocessed_result(
+                native_outputs=native_outputs,
+                sample=sample,
+                names=names,
+                preprocess_ms=float(native_outputs["preprocess_ms"]),
+                inference_ms=float(native_outputs["inference_ms"]),
+            )
+        return self._build_native_legacy_result(
+            native_outputs=raw_call(),
+            sample=sample,
+            names=names,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            retina_masks=retina_masks,
+            input_shape=input_shape,
+        )
 
     def _predict_prepared_tensor(
         self,
@@ -511,13 +616,36 @@ class YOLOEEngine:
             producer_stream = current_stream
 
         input_shape = (int(image_tensor.shape[2]), int(image_tensor.shape[3]))
+        sample = self._resolve_original_sample(item.original_image, item.path, input_shape)
         if self.native_main_runtime is not None:
-            native_outputs = self.native_main_runtime.infer_tensor(
-                int(image_tensor.data_ptr()), input_shape[0], input_shape[1], producer_stream
+            result = self._run_native_result(
+                sample=sample,
+                names=names,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+                input_shape=input_shape,
+                raw_call=lambda: self.native_main_runtime.infer_tensor(
+                    int(image_tensor.data_ptr()), input_shape[0], input_shape[1], producer_stream
+                ),
+                postprocessed_call=(
+                    lambda: self.native_main_runtime.infer_tensor_postprocessed(
+                        int(image_tensor.data_ptr()),
+                        input_shape[0],
+                        input_shape[1],
+                        int(sample.original.shape[0]),
+                        int(sample.original.shape[1]),
+                        float(conf),
+                        float(iou),
+                        int(max_det),
+                        bool(retina_masks),
+                        producer_stream,
+                    )
+                )
+                if hasattr(self.native_main_runtime, "infer_tensor_postprocessed")
+                else None,
             )
-            outputs = {name: from_dlpack(native_outputs[name]) for name in self._main_output_names}
-            preprocess_ms = float(native_outputs["preprocess_ms"])
-            inference_ms = float(native_outputs["inference_ms"])
         else:
             if self.main_runtime is None:
                 raise RuntimeError("Main runtime is not initialized")
@@ -531,32 +659,30 @@ class YOLOEEngine:
             torch.cuda.synchronize(self.device)
             preprocess_ms = 0.0
             inference_ms = (time.perf_counter() - inference_start) * 1000.0
-
-        sample = self._resolve_original_sample(item.original_image, item.path, input_shape)
-        postprocess_start = time.perf_counter()
-        speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
-        result = self._postprocess_predictions(
-            outputs=outputs,
-            sample=sample,
-            input_shape=input_shape,
-            names=names,
-            conf=conf,
-            iou=iou,
-            max_det=max_det,
-            retina_masks=retina_masks,
-            speed=speed,
-        )
-        speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
-        result.speed = speed
+            postprocess_start = time.perf_counter()
+            speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
+            result = self._postprocess_predictions(
+                outputs=outputs,
+                sample=sample,
+                input_shape=input_shape,
+                names=names,
+                conf=conf,
+                iou=iou,
+                max_det=max_det,
+                retina_masks=retina_masks,
+                speed=speed,
+            )
+            speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
+            result.speed = speed
         LOGGER.debug(
             "Completed prepared-tensor inference on '%s': input_shape=%s detections=%d "
             "pre=%.1fms inf=%.1fms post=%.1fms",
             sample.path,
             input_shape,
             int(result.boxes.data.shape[0]) if result.boxes is not None else 0,
-            speed["preprocess"],
-            speed["inference"],
-            speed["postprocess"],
+            result.speed["preprocess"],
+            result.speed["inference"],
+            result.speed["postprocess"],
         )
         return result
 
