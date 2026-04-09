@@ -19,6 +19,29 @@ class SourceItem:
     path: str
 
 
+@dataclass(frozen=True)
+class PreparedFrameMetadata:
+    original_shape: tuple[int, int]
+    path: str | None = None
+    preview_image: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        height = int(self.original_shape[0])
+        width = int(self.original_shape[1])
+        object.__setattr__(self, "original_shape", (height, width))
+        if height <= 0 or width <= 0:
+            raise ValueError("Prepared frame metadata requires a positive (height, width) original_shape")
+        if self.preview_image is not None:
+            if self.preview_image.ndim != 3 or int(self.preview_image.shape[2]) != 3:
+                raise ValueError("Prepared frame preview_image must be a BGR image with shape (H, W, 3)")
+            preview_shape = (int(self.preview_image.shape[0]), int(self.preview_image.shape[1]))
+            if preview_shape != self.original_shape:
+                raise ValueError(
+                    "Prepared frame preview_image shape must match original_shape; "
+                    f"got preview={preview_shape} original_shape={self.original_shape}"
+                )
+
+
 class SourceStream(Iterable[SourceItem]):
     is_live_source: bool = False
     max_frames: int | None = None

@@ -208,7 +208,8 @@ GitHub Actions is the supported automation path for this repository.
 - The prepared-tensor fast path is reached by passing the object returned from `prepare_cuda_input(...)` or by using `input_hint="prepared"`.
 - Plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors are still accepted without requiring manual preprocessing.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
-- Live USB camera input is available through a GStreamer appsink pipeline. Jetson zero-copy camera ingest is still on the roadmap.
+- Live camera sources can use a Jetson zero-copy NVMM/EGL/CUDA ingest path when the native camera backend is built and the source negotiates an NVMM pipeline.
+- `camera_source_from_spec(..., target_imgsz=..., zero_copy=None|True|False)` controls that camera ingest policy. `None` auto-selects zero-copy when available, `True` requires it, and `False` forces the fallback CPU appsink path.
 - Direct RTSP URLs such as `rtsp://camera.local/stream` are supported and resolved to a GStreamer RTSP pipeline automatically.
 - If you do not have a camera attached, use `videotest://<pattern>` such as `videotest://ball` or `videotest://smpte`.
 
@@ -234,7 +235,6 @@ GitHub Actions is the supported automation path for this repository.
 
 The project is usable today for Jetson-focused deployments, but it is still early-stage. The remaining performance roadmap is centered on:
 
-- Jetson zero-copy NVMM/EGL/CUDA camera ingest
 - CUDA preprocess instead of CPU/OpenCV preprocess
 - Native decode/NMS/mask reconstruction
 - Native visual-prompt execution

@@ -74,6 +74,8 @@ Direct RTSP input is also supported:
 yoloe-camera-gui --source rtsp://user:pass@camera.local:554/stream
 ```
 
+On Jetson builds with the native camera backend available, the GUI will use the zero-copy NVMM/EGL/CUDA ingest path automatically and fall back to the CPU appsink path only when the source cannot satisfy that contract.
+
 The GUI lets you change:
 
 - the video source
