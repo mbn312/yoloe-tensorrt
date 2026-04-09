@@ -114,18 +114,21 @@ def build_zero_copy_usb_camera_pipeline(
 
     if prefer_mjpeg:
         source_caps = "image/jpeg"
-        decode = "jpegparse ! nvv4l2decoder mjpeg=true enable-max-performance=true"
+        decode = "jpegparse ! nvv4l2decoder mjpeg=true enable-max-performance=true ! nvvidconv nvbuf-memory-type=4"
     else:
         source = f"nvv4l2camerasrc device={device_path} do-timestamp=true"
         source_caps = "video/x-raw(memory:NVMM),format=UYVY"
-        decode = "nvvidconv"
+        decode = "nvvidconv nvbuf-memory-type=4"
 
     if caps_parts:
         source_caps += "," + ",".join(caps_parts)
+    output_caps = "video/x-raw(memory:NVMM),format=BGRx"
+    if caps_parts:
+        output_caps += "," + ",".join(caps_parts)
 
     return (
         f"{source} ! {source_caps} ! {decode} ! "
-        f"video/x-raw(memory:NVMM),format=BGRx ! "
+        f"{output_caps} ! "
         f"appsink name={appsink_name} emit-signals=false max-buffers=1 drop=true sync=false"
     )
 
@@ -473,6 +476,8 @@ class JetsonZeroCopySource(SourceStream):
             while self.max_frames is None or frame_index < self.max_frames:
                 frame = native_source.read_frame()
                 if frame is None:
+                    if not yielded_any:
+                        raise RuntimeError("Zero-copy source reached EOS before yielding the first frame")
                     break
                 yielded_any = True
                 path = str(frame["path"])

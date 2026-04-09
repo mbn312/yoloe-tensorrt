@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 from yoloe_tensorrt import (
@@ -12,6 +13,7 @@ from yoloe_tensorrt import (
     camera_source_from_spec,
 )
 from yoloe_tensorrt.inputs import PreparedTensorInput
+from yoloe_tensorrt.source import SourceItem, SourceStream
 
 
 def test_build_usb_camera_pipeline_defaults_to_mjpeg_bgr_appsink() -> None:
@@ -77,7 +79,8 @@ def test_build_zero_copy_usb_camera_pipeline_targets_nvmm_bgrx() -> None:
 
     assert "v4l2src device=/dev/video0" in pipeline
     assert "nvv4l2decoder" in pipeline
-    assert "video/x-raw(memory:NVMM),format=BGRx" in pipeline
+    assert "nvvidconv nvbuf-memory-type=4" in pipeline
+    assert "video/x-raw(memory:NVMM),format=BGRx,width=640,height=480,framerate=30/1" in pipeline
     assert "appsink name=sink" in pipeline
 
 
@@ -248,4 +251,42 @@ def test_jetson_zero_copy_source_yields_prepared_tensor_inputs(monkeypatch: pyte
     assert item.path == "zc_frame000000"
     assert item.original_image.original_shape == (480, 640)
     assert item.original_image.preview_image.shape == (480, 640, 3)
+    assert fake_source.closed is True
+
+
+def test_jetson_zero_copy_source_falls_back_when_no_first_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeNativeSource:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def read_frame(self):
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FallbackSource(SourceStream):
+        def __iter__(self):
+            yield SourceItem(image=np.zeros((4, 5, 3), dtype=np.uint8), path="fallback_frame")
+
+    fake_source = _FakeNativeSource()
+    monkeypatch.setattr(
+        "yoloe_tensorrt.gstreamer.build_native_jetson_camera_source",
+        lambda *args, **kwargs: fake_source,
+    )
+
+    source = JetsonZeroCopySource(
+        pipeline="fake-pipeline",
+        prefix="zc",
+        target_imgsz=(320, 320),
+        fp16=False,
+        max_frames=1,
+        fallback_source=_FallbackSource(),
+        required=False,
+    )
+
+    items = list(source)
+
+    assert len(items) == 1
+    assert items[0].path == "fallback_frame"
     assert fake_source.closed is True
