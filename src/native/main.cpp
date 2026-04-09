@@ -32,9 +32,11 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -256,8 +258,119 @@ class NativeJetsonCameraSource;
 
 struct ManagedTensorContext {
     std::shared_ptr<NativeMainRuntime> owner;
+    std::shared_ptr<class PendingPostprocessOutputs> pending_postprocess_outputs;
     std::vector<std::int64_t> shape;
+    DLDataType dtype{};
     DLManagedTensor managed{};
+};
+
+struct NativePostprocessCandidate {
+    std::array<float, 4> input_box{};
+    std::array<float, 4> output_box{};
+    float confidence = 0.0f;
+    int cls = 0;
+    std::vector<float> mask_coeffs;
+};
+
+struct NativePostprocessResult {
+    std::vector<float> boxes;
+    std::vector<std::uint8_t> masks;
+    int mask_height = 0;
+    int mask_width = 0;
+    bool include_masks = false;
+};
+
+inline cudaStream_t parse_dlpack_consumer_stream(py::object const& stream)
+{
+    if (stream.is_none()) {
+        return cudaStreamLegacy;
+    }
+
+    auto const value = stream.cast<std::int64_t>();
+    if (value == 1) {
+        return cudaStreamLegacy;
+    }
+    if (value == 2) {
+        return cudaStreamPerThread;
+    }
+    if (value == 0 || value < 0) {
+        throw std::runtime_error("Invalid CUDA DLPack consumer stream value");
+    }
+    return reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(value));
+}
+
+struct PendingPostprocessOutputs {
+    CudaBuffer boxes_buffer;
+    CudaBuffer masks_buffer;
+    cudaEvent_t ready_event = nullptr;
+    int device_id = 0;
+
+    PendingPostprocessOutputs() = default;
+    PendingPostprocessOutputs(PendingPostprocessOutputs const&) = delete;
+    PendingPostprocessOutputs& operator=(PendingPostprocessOutputs const&) = delete;
+
+    ~PendingPostprocessOutputs()
+    {
+        if (device_id >= 0) {
+            cudaSetDevice(device_id);
+        }
+        if (ready_event != nullptr) {
+            cudaEventDestroy(ready_event);
+            ready_event = nullptr;
+        }
+    }
+
+    void record_ready_event(cudaStream_t stream)
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id), "cudaSetDevice failed for postprocess output event");
+        if (ready_event == nullptr) {
+            throw_if_cuda_failed(
+                cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming),
+                "cudaEventCreateWithFlags failed for postprocess output event");
+        }
+        try {
+            throw_if_cuda_failed(
+                cudaEventRecord(ready_event, stream),
+                "cudaEventRecord failed for postprocess output event");
+        } catch (...) {
+            throw;
+        }
+    }
+
+    void wait_on_consumer_stream(cudaStream_t consumer_stream) const
+    {
+        if (ready_event == nullptr) {
+            return;
+        }
+        throw_if_cuda_failed(cudaSetDevice(device_id), "cudaSetDevice failed for postprocess DLPack handoff");
+        throw_if_cuda_failed(
+            cudaStreamWaitEvent(consumer_stream, ready_event, 0),
+            "cudaStreamWaitEvent failed for postprocess DLPack handoff");
+    }
+
+    bool is_ready() const
+    {
+        if (ready_event == nullptr) {
+            return true;
+        }
+        auto const status = cudaEventQuery(ready_event);
+        if (status == cudaSuccess) {
+            return true;
+        }
+        if (status == cudaErrorNotReady) {
+            cudaGetLastError();
+            return false;
+        }
+        throw std::runtime_error(std::string("cudaEventQuery failed for postprocess output event: ") + cudaGetErrorString(status));
+    }
+};
+
+struct NativePostprocessUpload {
+    std::shared_ptr<PendingPostprocessOutputs> outputs;
+    std::vector<std::int64_t> boxes_shape;
+    std::vector<std::int64_t> masks_shape;
+    bool include_masks = false;
+    double postprocess_ms = 0.0;
 };
 
 #ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
@@ -360,38 +473,161 @@ struct ManagedCameraTensorContext {
     std::shared_ptr<NativeJetsonCameraSource> owner;
     std::shared_ptr<PendingJetsonFrame> frame;
     std::vector<std::int64_t> shape;
+    DLDataType dtype{};
     DLManagedTensor managed{};
 };
-
-inline cudaStream_t parse_dlpack_consumer_stream(py::object const& stream)
-{
-    if (stream.is_none()) {
-        return cudaStreamLegacy;
-    }
-
-    auto const value = stream.cast<std::int64_t>();
-    if (value == 1) {
-        return cudaStreamLegacy;
-    }
-    if (value == 2) {
-        return cudaStreamPerThread;
-    }
-    if (value == 0 || value < 0) {
-        throw std::runtime_error("Invalid CUDA DLPack consumer stream value");
-    }
-    return reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(value));
-}
 #endif
+
+inline float clip_float(float value, float low, float high)
+{
+    return std::max(low, std::min(value, high));
+}
+
+inline void clip_box_inplace(std::array<float, 4>& box, int image_h, int image_w)
+{
+    box[0] = clip_float(box[0], 0.0f, static_cast<float>(image_w));
+    box[1] = clip_float(box[1], 0.0f, static_cast<float>(image_h));
+    box[2] = clip_float(box[2], 0.0f, static_cast<float>(image_w));
+    box[3] = clip_float(box[3], 0.0f, static_cast<float>(image_h));
+}
+
+inline std::array<float, 4> scale_box_to_shape(std::array<float, 4> box, int input_h, int input_w, int output_h, int output_w)
+{
+    auto const geometry = compute_letterbox_geometry(output_w, output_h, input_w, input_h);
+    float const gain = static_cast<float>(geometry.resized_width) / static_cast<float>(output_w);
+    float const pad_x = static_cast<float>(geometry.pad_left);
+    float const pad_y = static_cast<float>(geometry.pad_top);
+
+    box[0] = (box[0] - pad_x) / gain;
+    box[1] = (box[1] - pad_y) / gain;
+    box[2] = (box[2] - pad_x) / gain;
+    box[3] = (box[3] - pad_y) / gain;
+    clip_box_inplace(box, output_h, output_w);
+    return box;
+}
+
+inline float box_iou(std::array<float, 4> const& lhs, std::array<float, 4> const& rhs)
+{
+    float const inter_x1 = std::max(lhs[0], rhs[0]);
+    float const inter_y1 = std::max(lhs[1], rhs[1]);
+    float const inter_x2 = std::min(lhs[2], rhs[2]);
+    float const inter_y2 = std::min(lhs[3], rhs[3]);
+    float const inter_w = std::max(0.0f, inter_x2 - inter_x1);
+    float const inter_h = std::max(0.0f, inter_y2 - inter_y1);
+    float const intersection = inter_w * inter_h;
+
+    float const lhs_area = std::max(0.0f, lhs[2] - lhs[0]) * std::max(0.0f, lhs[3] - lhs[1]);
+    float const rhs_area = std::max(0.0f, rhs[2] - rhs[0]) * std::max(0.0f, rhs[3] - rhs[1]);
+    float const denominator = lhs_area + rhs_area - intersection;
+    if (denominator <= 0.0f) {
+        return 0.0f;
+    }
+    return intersection / denominator;
+}
+
+inline cv::Mat make_float_mask_view(std::vector<float> const& data, int height, int width)
+{
+    return cv::Mat(height, width, CV_32FC1, const_cast<float*>(data.data()));
+}
+
+inline void crop_mask_inplace(std::vector<float>& mask, int height, int width, std::array<float, 4> const& box)
+{
+    int const left = std::max(0, std::min(width, static_cast<int>(std::ceil(box[0]))));
+    int const top = std::max(0, std::min(height, static_cast<int>(std::ceil(box[1]))));
+    int const right = std::max(0, std::min(width, static_cast<int>(std::ceil(box[2]))));
+    int const bottom = std::max(0, std::min(height, static_cast<int>(std::ceil(box[3]))));
+
+    if (left >= right || top >= bottom) {
+        std::fill(mask.begin(), mask.end(), 0.0f);
+        return;
+    }
+
+    for (int y = 0; y < top; ++y) {
+        std::fill_n(mask.data() + static_cast<std::size_t>(y * width), width, 0.0f);
+    }
+    for (int y = bottom; y < height; ++y) {
+        std::fill_n(mask.data() + static_cast<std::size_t>(y * width), width, 0.0f);
+    }
+    for (int y = top; y < bottom; ++y) {
+        auto* row = mask.data() + static_cast<std::size_t>(y * width);
+        std::fill(row, row + left, 0.0f);
+        std::fill(row + right, row + width, 0.0f);
+    }
+}
+
+inline std::vector<float> resize_mask(std::vector<float> const& mask, int src_h, int src_w, int dst_h, int dst_w)
+{
+    cv::Mat const src = make_float_mask_view(mask, src_h, src_w);
+    cv::Mat resized;
+    cv::resize(src, resized, cv::Size(dst_w, dst_h), 0.0, 0.0, cv::INTER_LINEAR);
+    if (!resized.isContinuous()) {
+        resized = resized.clone();
+    }
+    std::vector<float> result(static_cast<std::size_t>(dst_h) * static_cast<std::size_t>(dst_w));
+    std::memcpy(result.data(), resized.ptr<float>(), result.size() * sizeof(float));
+    return result;
+}
+
+inline std::vector<float> scale_mask_to_shape(std::vector<float> const& mask, int src_h, int src_w, int dst_h, int dst_w)
+{
+    auto const geometry = compute_letterbox_geometry(dst_w, dst_h, src_w, src_h);
+    int const top = std::max(0, std::min(src_h, geometry.pad_top));
+    int const left = std::max(0, std::min(src_w, geometry.pad_left));
+    int const bottom = std::max(top + 1, std::min(src_h, top + geometry.resized_height));
+    int const right = std::max(left + 1, std::min(src_w, left + geometry.resized_width));
+
+    cv::Mat const src = make_float_mask_view(mask, src_h, src_w);
+    cv::Mat cropped = src(cv::Range(top, bottom), cv::Range(left, right));
+    cv::Mat resized;
+    cv::resize(cropped, resized, cv::Size(dst_w, dst_h), 0.0, 0.0, cv::INTER_LINEAR);
+    if (!resized.isContinuous()) {
+        resized = resized.clone();
+    }
+    std::vector<float> result(static_cast<std::size_t>(dst_h) * static_cast<std::size_t>(dst_w));
+    std::memcpy(result.data(), resized.ptr<float>(), result.size() * sizeof(float));
+    return result;
+}
+
+inline bool threshold_mask(std::vector<float> const& src, std::vector<std::uint8_t>& dst)
+{
+    dst.resize(src.size());
+    bool any = false;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        auto const value = static_cast<std::uint8_t>(src[i] > 0.0f ? 1U : 0U);
+        dst[i] = value;
+        any = any || value != 0U;
+    }
+    return any;
+}
 
 class CudaTensorView {
 public:
     CudaTensorView(
         std::shared_ptr<NativeMainRuntime> owner,
+        std::shared_ptr<PendingPostprocessOutputs> pending_postprocess_outputs,
         void* ptr,
         std::vector<std::int64_t> shape,
         nvinfer1::DataType dtype,
         int device_id)
+        : CudaTensorView(
+              std::move(owner),
+              std::move(pending_postprocess_outputs),
+              ptr,
+              std::move(shape),
+              to_dlpack_dtype(dtype),
+              device_id)
+    {
+    }
+
+    CudaTensorView(
+        std::shared_ptr<NativeMainRuntime> owner,
+        std::shared_ptr<PendingPostprocessOutputs> pending_postprocess_outputs,
+        void* ptr,
+        std::vector<std::int64_t> shape,
+        DLDataType dtype,
+        int device_id)
         : owner_(std::move(owner))
+        , pending_postprocess_outputs_(std::move(pending_postprocess_outputs))
         , ptr_(ptr)
         , shape_(std::move(shape))
         , dtype_(dtype)
@@ -399,11 +635,16 @@ public:
     {
     }
 
-    py::capsule dlpack() const
+    py::capsule dlpack(py::object stream) const
     {
+        if (pending_postprocess_outputs_ != nullptr) {
+            pending_postprocess_outputs_->wait_on_consumer_stream(parse_dlpack_consumer_stream(stream));
+        }
         auto* ctx = new ManagedTensorContext();
         ctx->owner = owner_;
+        ctx->pending_postprocess_outputs = pending_postprocess_outputs_;
         ctx->shape = shape_;
+        ctx->dtype = dtype_;
         ctx->managed.manager_ctx = ctx;
         ctx->managed.deleter = [](DLManagedTensor* self) {
             auto* managed_ctx = static_cast<ManagedTensorContext*>(self->manager_ctx);
@@ -412,7 +653,7 @@ public:
         ctx->managed.dl_tensor.data = ptr_;
         ctx->managed.dl_tensor.device = DLDevice{kDLCUDA, device_id_};
         ctx->managed.dl_tensor.ndim = static_cast<int>(ctx->shape.size());
-        ctx->managed.dl_tensor.dtype = to_dlpack_dtype(dtype_);
+        ctx->managed.dl_tensor.dtype = ctx->dtype;
         ctx->managed.dl_tensor.shape = ctx->shape.data();
         ctx->managed.dl_tensor.strides = nullptr;
         ctx->managed.dl_tensor.byte_offset = 0;
@@ -435,9 +676,10 @@ public:
 
 private:
     std::shared_ptr<NativeMainRuntime> owner_;
+    std::shared_ptr<PendingPostprocessOutputs> pending_postprocess_outputs_;
     void* ptr_ = nullptr;
     std::vector<std::int64_t> shape_;
-    nvinfer1::DataType dtype_ = nvinfer1::DataType::kFLOAT;
+    DLDataType dtype_{2, 32, 1};
     int device_id_ = 0;
 };
 
@@ -450,6 +692,17 @@ public:
         void* ptr,
         std::vector<std::int64_t> shape,
         nvinfer1::DataType dtype,
+        int device_id)
+        : CameraCudaTensorView(std::move(owner), std::move(frame), ptr, std::move(shape), to_dlpack_dtype(dtype), device_id)
+    {
+    }
+
+    CameraCudaTensorView(
+        std::shared_ptr<NativeJetsonCameraSource> owner,
+        std::shared_ptr<PendingJetsonFrame> frame,
+        void* ptr,
+        std::vector<std::int64_t> shape,
+        DLDataType dtype,
         int device_id)
         : owner_(std::move(owner))
         , frame_(std::move(frame))
@@ -469,6 +722,7 @@ public:
         ctx->owner = owner_;
         ctx->frame = frame_;
         ctx->shape = shape_;
+        ctx->dtype = dtype_;
         ctx->managed.manager_ctx = ctx;
         ctx->managed.deleter = [](DLManagedTensor* self) {
             auto* managed_ctx = static_cast<ManagedCameraTensorContext*>(self->manager_ctx);
@@ -477,7 +731,7 @@ public:
         ctx->managed.dl_tensor.data = ptr_;
         ctx->managed.dl_tensor.device = DLDevice{kDLCUDA, device_id_};
         ctx->managed.dl_tensor.ndim = static_cast<int>(ctx->shape.size());
-        ctx->managed.dl_tensor.dtype = to_dlpack_dtype(dtype_);
+        ctx->managed.dl_tensor.dtype = ctx->dtype;
         ctx->managed.dl_tensor.shape = ctx->shape.data();
         ctx->managed.dl_tensor.strides = nullptr;
         ctx->managed.dl_tensor.byte_offset = 0;
@@ -503,7 +757,7 @@ private:
     std::shared_ptr<PendingJetsonFrame> frame_;
     void* ptr_ = nullptr;
     std::vector<std::int64_t> shape_;
-    nvinfer1::DataType dtype_ = nvinfer1::DataType::kFLOAT;
+    DLDataType dtype_{2, 32, 1};
     int device_id_ = 0;
 };
 #endif
@@ -676,6 +930,44 @@ public:
         return build_output_dict(target_h, target_w, preprocess_ms, inference_ms);
     }
 
+    py::dict infer_image_postprocessed(
+        py::array image_py,
+        int target_h,
+        int target_w,
+        int original_h,
+        int original_w,
+        float conf,
+        float iou,
+        int max_det,
+        bool retina_masks)
+    {
+        if (!has_prompt_embeddings_) {
+            throw std::runtime_error("No prompt embeddings are active");
+        }
+
+        auto image = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>(image_py);
+        auto const info = image.request();
+        if (info.ndim != 3 || info.shape[2] != 3) {
+            throw std::runtime_error("image must have shape (H, W, 3)");
+        }
+
+        activate_device("cudaSetDevice failed before native postprocessed image inference");
+        preprocess_host_image(image, target_h, target_w);
+        auto const inference_ms = execute(image_buffer_.data(), target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
+        auto const preprocess_ms = resolve_preprocess_ms();
+        return finish_postprocessed_inference(
+            target_h,
+            target_w,
+            original_h,
+            original_w,
+            conf,
+            iou,
+            max_det,
+            retina_masks,
+            preprocess_ms,
+            inference_ms);
+    }
+
     py::dict _preprocess_image_to_tensor(py::array image_py, int target_h, int target_w)
     {
         auto image = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>(image_py);
@@ -693,6 +985,7 @@ public:
         outputs[py::str("tensor")] = py::cast(
             CudaTensorView(
                 shared_from_this(),
+                nullptr,
                 image_buffer_.data(),
                 std::vector<std::int64_t>{ 1, 3, target_h, target_w },
                 image_binding_.dtype,
@@ -718,6 +1011,43 @@ public:
         auto const inference_ms = execute(image_ptr, target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
 
         return build_output_dict(target_h, target_w, 0.0, inference_ms);
+    }
+
+    py::dict infer_tensor_postprocessed(
+        std::uintptr_t image_ptr_value,
+        int target_h,
+        int target_w,
+        int original_h,
+        int original_w,
+        float conf,
+        float iou,
+        int max_det,
+        bool retina_masks,
+        std::uintptr_t producer_stream_value = 0)
+    {
+        if (!has_prompt_embeddings_) {
+            throw std::runtime_error("No prompt embeddings are active");
+        }
+        if (image_ptr_value == 0) {
+            throw std::runtime_error("image tensor pointer must not be null");
+        }
+
+        auto* image_ptr = reinterpret_cast<void*>(image_ptr_value);
+        auto* producer_stream = reinterpret_cast<cudaStream_t>(producer_stream_value);
+        activate_device("cudaSetDevice failed before native postprocessed tensor inference");
+        wait_for_producer_stream(producer_stream);
+        auto const inference_ms = execute(image_ptr, target_h, target_w, prompt_buffer_.data(), current_prompt_count_);
+        return finish_postprocessed_inference(
+            target_h,
+            target_w,
+            original_h,
+            original_w,
+            conf,
+            iou,
+            max_det,
+            retina_masks,
+            0.0,
+            inference_ms);
     }
 
     void warmup(int target_h, int target_w, int prompt_count, int runs)
@@ -796,12 +1126,439 @@ private:
             auto const binding_index = output_indices_[i];
             auto const& binding = bindings_[binding_index];
             outputs[py::str(binding.name)] = py::cast(
-                CudaTensorView(shared_from_this(), output_buffers_[i].data(), output_shapes_[i], binding.dtype, device_id_));
+                CudaTensorView(shared_from_this(), nullptr, output_buffers_[i].data(), output_shapes_[i], binding.dtype, device_id_));
         }
         outputs[py::str("input_shape")] = py::make_tuple(target_h, target_w);
         outputs[py::str("preprocess_ms")] = preprocess_ms;
         outputs[py::str("inference_ms")] = inference_ms;
         return outputs;
+    }
+
+    py::dict finish_postprocessed_inference(
+        int target_h,
+        int target_w,
+        int original_h,
+        int original_w,
+        float conf_threshold,
+        float iou_threshold,
+        int max_det,
+        bool retina_masks,
+        double preprocess_ms,
+        double inference_ms)
+    {
+        auto upload = postprocess_outputs(
+            target_h,
+            target_w,
+            original_h,
+            original_w,
+            conf_threshold,
+            iou_threshold,
+            max_det,
+            retina_masks);
+        return build_postprocessed_output_dict(target_h, target_w, preprocess_ms, inference_ms, upload);
+    }
+
+    py::dict build_postprocessed_output_dict(
+        int target_h,
+        int target_w,
+        double preprocess_ms,
+        double inference_ms,
+        NativePostprocessUpload const& upload)
+    {
+        py::dict outputs;
+        outputs[py::str("boxes")] = py::cast(
+            CudaTensorView(
+                shared_from_this(),
+                upload.outputs,
+                upload.outputs->boxes_buffer.data(),
+                upload.boxes_shape,
+                DLDataType{2, 32, 1},
+                device_id_));
+        if (upload.include_masks) {
+            outputs[py::str("masks")] = py::cast(
+                CudaTensorView(
+                    shared_from_this(),
+                    upload.outputs,
+                    upload.outputs->masks_buffer.data(),
+                    upload.masks_shape,
+                    DLDataType{1, 8, 1},
+                    device_id_));
+        }
+        outputs[py::str("input_shape")] = py::make_tuple(target_h, target_w);
+        outputs[py::str("preprocess_ms")] = preprocess_ms;
+        outputs[py::str("inference_ms")] = inference_ms;
+        outputs[py::str("postprocess_ms")] = upload.postprocess_ms;
+        return outputs;
+    }
+
+    NativePostprocessUpload upload_postprocess_result(NativePostprocessResult const& result)
+    {
+        NativePostprocessUpload upload;
+        upload.outputs = std::make_shared<PendingPostprocessOutputs>();
+        upload.outputs->device_id = device_id_;
+        upload.include_masks = result.include_masks;
+        upload.boxes_shape = { static_cast<std::int64_t>(result.boxes.size() / 6), 6 };
+
+        auto const box_bytes = std::max<std::size_t>(sizeof(float), result.boxes.size() * sizeof(float));
+        upload.outputs->boxes_buffer.ensure(box_bytes);
+        if (!result.boxes.empty()) {
+            throw_if_cuda_failed(
+                cudaMemcpyAsync(
+                    upload.outputs->boxes_buffer.data(),
+                    result.boxes.data(),
+                    result.boxes.size() * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream_),
+                "cudaMemcpyAsync failed for native postprocessed boxes");
+        }
+
+        if (result.include_masks) {
+            upload.masks_shape = {
+                static_cast<std::int64_t>(result.boxes.size() / 6),
+                static_cast<std::int64_t>(result.mask_height),
+                static_cast<std::int64_t>(result.mask_width),
+            };
+            auto const mask_bytes = std::max<std::size_t>(sizeof(std::uint8_t), result.masks.size() * sizeof(std::uint8_t));
+            upload.outputs->masks_buffer.ensure(mask_bytes);
+            if (!result.masks.empty()) {
+                throw_if_cuda_failed(
+                    cudaMemcpyAsync(
+                        upload.outputs->masks_buffer.data(),
+                        result.masks.data(),
+                        result.masks.size() * sizeof(std::uint8_t),
+                        cudaMemcpyHostToDevice,
+                        stream_),
+                    "cudaMemcpyAsync failed for native postprocessed masks");
+            }
+        }
+
+        upload.outputs->record_ready_event(stream_);
+        return upload;
+    }
+
+    std::vector<float> copy_output_buffer_to_float(std::size_t output_position)
+    {
+        auto const binding_index = output_indices_[output_position];
+        auto const& binding = bindings_[binding_index];
+        auto const count = std::accumulate(
+            output_shapes_[output_position].begin(),
+            output_shapes_[output_position].end(),
+            static_cast<std::size_t>(1),
+            [](std::size_t lhs, std::int64_t rhs) { return lhs * static_cast<std::size_t>(rhs); });
+
+        std::vector<float> host_output(count);
+        if (binding.dtype == nvinfer1::DataType::kFLOAT) {
+            if (count > 0) {
+                throw_if_cuda_failed(
+                    cudaMemcpy(host_output.data(), output_buffers_[output_position].data(), count * sizeof(float), cudaMemcpyDeviceToHost),
+                    "cudaMemcpy failed for TensorRT output");
+            }
+            return host_output;
+        }
+        if (binding.dtype == nvinfer1::DataType::kHALF) {
+            std::vector<__half> host_half(count);
+            if (count > 0) {
+                throw_if_cuda_failed(
+                    cudaMemcpy(host_half.data(), output_buffers_[output_position].data(), count * sizeof(__half), cudaMemcpyDeviceToHost),
+                    "cudaMemcpy failed for TensorRT half output");
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                host_output[i] = __half2float(host_half[i]);
+            }
+            return host_output;
+        }
+        throw std::runtime_error("Native postprocess only supports float/half TensorRT outputs");
+    }
+
+    bool task_is_segment() const
+    {
+        return output_shapes_.size() == 2;
+    }
+
+    bool output_layout_is_end2end() const
+    {
+        return output_shapes_.size() >= 1 && output_shapes_[0].size() == 3 && output_shapes_[0][1] > output_shapes_[0][2];
+    }
+
+    int mask_dim() const
+    {
+        if (!task_is_segment()) {
+            return 0;
+        }
+        if (output_shapes_[1].size() < 4) {
+            throw std::runtime_error("Segmentation proto output shape is invalid for native postprocess");
+        }
+        return static_cast<int>(output_shapes_[1][1]);
+    }
+
+    std::vector<NativePostprocessCandidate> decode_end2end_candidates(
+        std::vector<float> const& predictions,
+        float conf_threshold,
+        int max_det)
+    {
+        if (max_det <= 0) {
+            return {};
+        }
+        auto const& shape = output_shapes_[0];
+        int const det_count = static_cast<int>(shape[1]);
+        int const det_width = static_cast<int>(shape[2]);
+        int const extra = std::max(0, det_width - 6);
+        std::vector<NativePostprocessCandidate> detections;
+        detections.reserve(static_cast<std::size_t>(std::min(det_count, max_det)));
+
+        for (int index = 0; index < det_count; ++index) {
+            auto const* row = predictions.data() + static_cast<std::size_t>(index * det_width);
+            if (row[4] <= conf_threshold) {
+                continue;
+            }
+            NativePostprocessCandidate detection;
+            detection.input_box = { row[0], row[1], row[2], row[3] };
+            detection.output_box = detection.input_box;
+            detection.confidence = row[4];
+            detection.cls = static_cast<int>(row[5]);
+            if (extra > 0) {
+                detection.mask_coeffs.assign(row + 6, row + 6 + extra);
+            }
+            detections.push_back(std::move(detection));
+            if (static_cast<int>(detections.size()) >= max_det) {
+                break;
+            }
+        }
+        return detections;
+    }
+
+    std::vector<NativePostprocessCandidate> decode_raw_candidates(
+        std::vector<float> const& predictions,
+        float conf_threshold,
+        float iou_threshold,
+        int max_det)
+    {
+        if (max_det <= 0) {
+            return {};
+        }
+        auto const& shape = output_shapes_[0];
+        int const channels = static_cast<int>(shape[1]);
+        int const box_count = static_cast<int>(shape[2]);
+        int const extra = mask_dim();
+        int const class_count = channels - 4 - extra;
+        if (class_count <= 0) {
+            throw std::runtime_error("TensorRT output does not expose a valid class dimension for native postprocess");
+        }
+
+        std::vector<NativePostprocessCandidate> candidates;
+        candidates.reserve(static_cast<std::size_t>(box_count));
+        for (int box_index = 0; box_index < box_count; ++box_index) {
+            auto const offset = [box_count](int channel) {
+                return static_cast<std::size_t>(channel * box_count);
+            };
+            float best_score = -1.0f;
+            int best_class = -1;
+            for (int cls_index = 0; cls_index < class_count; ++cls_index) {
+                auto const score = predictions[offset(4 + cls_index) + static_cast<std::size_t>(box_index)];
+                if (score > best_score) {
+                    best_score = score;
+                    best_class = cls_index;
+                }
+            }
+            if (best_score <= conf_threshold) {
+                continue;
+            }
+
+            float const cx = predictions[offset(0) + static_cast<std::size_t>(box_index)];
+            float const cy = predictions[offset(1) + static_cast<std::size_t>(box_index)];
+            float const width = predictions[offset(2) + static_cast<std::size_t>(box_index)];
+            float const height = predictions[offset(3) + static_cast<std::size_t>(box_index)];
+
+            NativePostprocessCandidate detection;
+            detection.input_box = {
+                cx - (width * 0.5f),
+                cy - (height * 0.5f),
+                cx + (width * 0.5f),
+                cy + (height * 0.5f),
+            };
+            detection.output_box = detection.input_box;
+            detection.confidence = best_score;
+            detection.cls = best_class;
+            if (extra > 0) {
+                detection.mask_coeffs.resize(static_cast<std::size_t>(extra));
+                for (int extra_index = 0; extra_index < extra; ++extra_index) {
+                    detection.mask_coeffs[static_cast<std::size_t>(extra_index)] =
+                        predictions[offset(4 + class_count + extra_index) + static_cast<std::size_t>(box_index)];
+                }
+            }
+            candidates.push_back(std::move(detection));
+        }
+
+        std::stable_sort(
+            candidates.begin(),
+            candidates.end(),
+            [](NativePostprocessCandidate const& lhs, NativePostprocessCandidate const& rhs) {
+                return lhs.confidence > rhs.confidence;
+            });
+
+        constexpr std::size_t kMaxNativeNms = 30000;
+        if (candidates.size() > kMaxNativeNms) {
+            candidates.resize(kMaxNativeNms);
+        }
+
+        std::vector<NativePostprocessCandidate> kept;
+        kept.reserve(static_cast<std::size_t>(max_det));
+        for (auto const& candidate : candidates) {
+            bool suppressed = false;
+            for (auto const& selected : kept) {
+                if (box_iou(candidate.input_box, selected.input_box) > iou_threshold) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (suppressed) {
+                continue;
+            }
+            kept.push_back(candidate);
+            if (static_cast<int>(kept.size()) >= max_det) {
+                break;
+            }
+        }
+        return kept;
+    }
+
+    std::vector<float> reconstruct_mask_logits(
+        std::vector<float> const& proto,
+        std::vector<float> const& coeffs,
+        int proto_h,
+        int proto_w) const
+    {
+        int const channels = static_cast<int>(coeffs.size());
+        std::vector<float> mask(static_cast<std::size_t>(proto_h) * static_cast<std::size_t>(proto_w), 0.0f);
+        for (int channel = 0; channel < channels; ++channel) {
+            auto const coeff = coeffs[static_cast<std::size_t>(channel)];
+            auto const* proto_channel = proto.data() + static_cast<std::size_t>(channel * proto_h * proto_w);
+            for (std::size_t index = 0; index < mask.size(); ++index) {
+                mask[index] += coeff * proto_channel[index];
+            }
+        }
+        return mask;
+    }
+
+    std::vector<std::uint8_t> build_mask_for_detection(
+        NativePostprocessCandidate const& detection,
+        std::vector<float> const& proto,
+        int input_h,
+        int input_w,
+        int original_h,
+        int original_w,
+        bool retina_masks) const
+    {
+        int const proto_channels = mask_dim();
+        int const proto_h = static_cast<int>(output_shapes_[1][2]);
+        int const proto_w = static_cast<int>(output_shapes_[1][3]);
+        if (proto_channels != static_cast<int>(detection.mask_coeffs.size())) {
+            throw std::runtime_error("Mask coefficient dimension does not match segmentation proto output");
+        }
+
+        auto mask = reconstruct_mask_logits(proto, detection.mask_coeffs, proto_h, proto_w);
+        if (retina_masks) {
+            auto scaled = scale_mask_to_shape(mask, proto_h, proto_w, original_h, original_w);
+            crop_mask_inplace(scaled, original_h, original_w, detection.output_box);
+            std::vector<std::uint8_t> binary;
+            if (!threshold_mask(scaled, binary)) {
+                binary.clear();
+            }
+            return binary;
+        }
+
+        std::array<float, 4> proto_box = {
+            detection.input_box[0] * (static_cast<float>(proto_w) / static_cast<float>(input_w)),
+            detection.input_box[1] * (static_cast<float>(proto_h) / static_cast<float>(input_h)),
+            detection.input_box[2] * (static_cast<float>(proto_w) / static_cast<float>(input_w)),
+            detection.input_box[3] * (static_cast<float>(proto_h) / static_cast<float>(input_h)),
+        };
+        crop_mask_inplace(mask, proto_h, proto_w, proto_box);
+        auto upsampled = resize_mask(mask, proto_h, proto_w, input_h, input_w);
+        std::vector<std::uint8_t> binary;
+        if (!threshold_mask(upsampled, binary)) {
+            binary.clear();
+        }
+        return binary;
+    }
+
+    NativePostprocessUpload postprocess_outputs(
+        int input_h,
+        int input_w,
+        int original_h,
+        int original_w,
+        float conf_threshold,
+        float iou_threshold,
+        int max_det,
+        bool retina_masks)
+    {
+        auto const start = Clock::now();
+        if (max_det <= 0) {
+            auto upload = upload_postprocess_result(NativePostprocessResult{});
+            upload.postprocess_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+            return upload;
+        }
+        auto const predictions = copy_output_buffer_to_float(0);
+        std::vector<NativePostprocessCandidate> detections =
+            output_layout_is_end2end()
+                ? decode_end2end_candidates(predictions, conf_threshold, max_det)
+                : decode_raw_candidates(predictions, conf_threshold, iou_threshold, max_det);
+
+        std::vector<float> proto;
+        if (task_is_segment()) {
+            proto = copy_output_buffer_to_float(1);
+        }
+
+        int const mask_h = retina_masks ? original_h : input_h;
+        int const mask_w = retina_masks ? original_w : input_w;
+        bool const had_mask_candidates = task_is_segment() && !detections.empty();
+        NativePostprocessResult result;
+        result.mask_height = mask_h;
+        result.mask_width = mask_w;
+
+        for (auto& detection : detections) {
+            detection.output_box = scale_box_to_shape(detection.input_box, input_h, input_w, original_h, original_w);
+        }
+
+        std::vector<std::vector<std::uint8_t>> masks_by_detection;
+        if (task_is_segment()) {
+            masks_by_detection.reserve(detections.size());
+        }
+
+        for (auto const& detection : detections) {
+            std::vector<std::uint8_t> binary_mask;
+            if (task_is_segment()) {
+                binary_mask = build_mask_for_detection(detection, proto, input_h, input_w, original_h, original_w, retina_masks);
+                if (binary_mask.empty()) {
+                    continue;
+                }
+                masks_by_detection.push_back(std::move(binary_mask));
+            }
+
+            result.boxes.insert(
+                result.boxes.end(),
+                {
+                    detection.output_box[0],
+                    detection.output_box[1],
+                    detection.output_box[2],
+                    detection.output_box[3],
+                    detection.confidence,
+                    static_cast<float>(detection.cls),
+                });
+        }
+
+        if (task_is_segment() && (!masks_by_detection.empty() || had_mask_candidates)) {
+            result.include_masks = true;
+            result.masks.reserve(
+                masks_by_detection.size() * static_cast<std::size_t>(mask_h) * static_cast<std::size_t>(mask_w));
+            for (auto const& mask : masks_by_detection) {
+                result.masks.insert(result.masks.end(), mask.begin(), mask.end());
+            }
+        }
+
+        auto upload = upload_postprocess_result(result);
+        upload.postprocess_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        return upload;
     }
 
     int find_binding_index(std::string const& name, bool is_input) const
@@ -1491,7 +2248,7 @@ PYBIND11_MODULE(_native, m)
     m.doc() = "Native TensorRT runtime for yoloe_tensorrt";
 
     py::class_<CudaTensorView>(m, "CudaTensorView")
-        .def("__dlpack__", [](CudaTensorView const& self, py::object) { return self.dlpack(); }, py::arg("stream") = py::none())
+        .def("__dlpack__", [](CudaTensorView const& self, py::object stream) { return self.dlpack(std::move(stream)); }, py::arg("stream") = py::none())
         .def("__dlpack_device__", &CudaTensorView::dlpack_device);
 
 #ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
@@ -1508,6 +2265,18 @@ PYBIND11_MODULE(_native, m)
         .def("set_prompt_embeddings", &NativeMainRuntime::set_prompt_embeddings, py::arg("prompt_embeddings"))
         .def("infer_image", &NativeMainRuntime::infer_image, py::arg("image"), py::arg("target_h"), py::arg("target_w"))
         .def(
+            "infer_image_postprocessed",
+            &NativeMainRuntime::infer_image_postprocessed,
+            py::arg("image"),
+            py::arg("target_h"),
+            py::arg("target_w"),
+            py::arg("original_h"),
+            py::arg("original_w"),
+            py::arg("conf"),
+            py::arg("iou"),
+            py::arg("max_det"),
+            py::arg("retina_masks"))
+        .def(
             "_preprocess_image_to_tensor",
             &NativeMainRuntime::_preprocess_image_to_tensor,
             py::arg("image"),
@@ -1519,6 +2288,19 @@ PYBIND11_MODULE(_native, m)
             py::arg("image_ptr"),
             py::arg("target_h"),
             py::arg("target_w"),
+            py::arg("producer_stream") = 0)
+        .def(
+            "infer_tensor_postprocessed",
+            &NativeMainRuntime::infer_tensor_postprocessed,
+            py::arg("image_ptr"),
+            py::arg("target_h"),
+            py::arg("target_w"),
+            py::arg("original_h"),
+            py::arg("original_w"),
+            py::arg("conf"),
+            py::arg("iou"),
+            py::arg("max_det"),
+            py::arg("retina_masks"),
             py::arg("producer_stream") = 0)
         .def("warmup", &NativeMainRuntime::warmup, py::arg("target_h"), py::arg("target_w"), py::arg("prompt_count"), py::arg("runs") = 2);
 

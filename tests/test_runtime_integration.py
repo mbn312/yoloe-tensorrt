@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -43,6 +44,128 @@ def _assert_live_result_contract(result, expected_names: dict[int, str], path_pr
     if result.masks is not None:
         assert tuple(result.masks.orig_shape) == tuple(result.orig_shape)
         assert result.masks.data.shape[0] == result.boxes.data.shape[0]
+
+
+def _sorted_result_tensors(result) -> tuple[torch.Tensor, torch.Tensor | None]:
+    boxes = result.boxes.data.detach().cpu()
+    order = sorted(
+        range(int(boxes.shape[0])),
+        key=lambda index: (
+            int(round(float(boxes[index, 5].item()))),
+            -float(boxes[index, 4].item()),
+            float(boxes[index, 0].item()),
+            float(boxes[index, 1].item()),
+            float(boxes[index, 2].item()),
+            float(boxes[index, 3].item()),
+        ),
+    )
+    if order:
+        boxes = boxes[order]
+    masks = result.masks.data.detach().cpu() if result.masks is not None else None
+    if masks is not None and order:
+        masks = masks[order]
+    return boxes, masks
+
+
+def _assert_native_postprocess_matches_python_reference(actual, reference) -> None:
+    assert actual.orig_shape == reference.orig_shape
+    assert actual.names == reference.names
+
+    actual_boxes, actual_masks = _sorted_result_tensors(actual)
+    reference_boxes, reference_masks = _sorted_result_tensors(reference)
+    assert actual_boxes.shape == reference_boxes.shape
+    torch.testing.assert_close(actual_boxes[:, :5], reference_boxes[:, :5], atol=1e-2, rtol=1e-3)
+    assert torch.equal(actual_boxes[:, 5].round().to(torch.int64), reference_boxes[:, 5].round().to(torch.int64))
+
+    if reference_masks is None:
+        assert actual_masks is None
+        return
+
+    assert actual_masks is not None
+    assert actual_masks.shape == reference_masks.shape
+    for index in range(int(actual_masks.shape[0])):
+        actual_mask = actual_masks[index].to(torch.bool)
+        reference_mask = reference_masks[index].to(torch.bool)
+        union = torch.logical_or(actual_mask, reference_mask).sum().item()
+        if union == 0:
+            continue
+        intersection = torch.logical_and(actual_mask, reference_mask).sum().item()
+        assert (intersection / union) >= 0.98
+
+
+def _python_reference_from_native_image_outputs(
+    runtime_engine: YOLOEEngine,
+    item: SourceItem,
+    labels: list[str],
+    imgsz: tuple[int, int],
+    conf: float,
+    iou: float,
+    max_det: int,
+    retina_masks: bool,
+):
+    native_runtime = runtime_engine.native_main_runtime
+    assert native_runtime is not None
+    native_outputs = native_runtime.infer_image(item.image, imgsz[0], imgsz[1])
+    outputs = {name: from_dlpack(native_outputs[name]) for name in runtime_engine._main_output_names}
+    speed = {
+        "preprocess": float(native_outputs["preprocess_ms"]),
+        "inference": float(native_outputs["inference_ms"]),
+        "postprocess": 0.0,
+    }
+    return runtime_engine._postprocess_predictions(
+        outputs=outputs,
+        sample=SimpleNamespace(original=item.image, path=item.path),
+        input_shape=tuple(int(v) for v in native_outputs["input_shape"]),
+        names=labels,
+        conf=conf,
+        iou=iou,
+        max_det=max_det,
+        retina_masks=retina_masks,
+        speed=speed,
+    )
+
+
+def _python_reference_from_native_tensor_outputs(
+    runtime_engine: YOLOEEngine,
+    prepared: PreparedTensorInput,
+    labels: list[str],
+    conf: float,
+    iou: float,
+    max_det: int,
+    retina_masks: bool,
+):
+    native_runtime = runtime_engine.native_main_runtime
+    assert native_runtime is not None
+    input_shape = (int(prepared.tensor.shape[2]), int(prepared.tensor.shape[3]))
+    producer_stream = (
+        prepared.producer_stream
+        if prepared.producer_stream is not None
+        else int(torch.cuda.current_stream(runtime_engine.device).cuda_stream)
+    )
+    native_outputs = native_runtime.infer_tensor(
+        int(prepared.tensor.data_ptr()),
+        input_shape[0],
+        input_shape[1],
+        producer_stream,
+    )
+    outputs = {name: from_dlpack(native_outputs[name]) for name in runtime_engine._main_output_names}
+    sample = runtime_engine._resolve_original_sample(prepared.original_image, prepared.path, input_shape)
+    speed = {
+        "preprocess": float(native_outputs["preprocess_ms"]),
+        "inference": float(native_outputs["inference_ms"]),
+        "postprocess": 0.0,
+    }
+    return runtime_engine._postprocess_predictions(
+        outputs=outputs,
+        sample=sample,
+        input_shape=tuple(int(v) for v in native_outputs["input_shape"]),
+        names=labels,
+        conf=conf,
+        iou=iou,
+        max_det=max_det,
+        retina_masks=retina_masks,
+        speed=speed,
+    )
 
 
 @pytest.mark.integration
@@ -173,6 +296,116 @@ def test_native_preprocess_matches_python_reference_for_padded_image(
     assert native_tensor.dtype == prepared.tensor.dtype
     assert torch.allclose(native_tensor.float(), prepared.tensor.float(), atol=5e-3, rtol=1e-3)
     assert float(native_tensor[0, 0, 0, 0].float().item()) == pytest.approx(114.0 / 255.0, abs=5e-3)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("retina_masks", [False, True])
+def test_native_postprocess_matches_python_reference_for_image(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+    retina_masks: bool,
+) -> None:
+    runtime_engine.clear_prompts()
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+
+    image_path = test_images["bus"]
+    item = normalize_source(image_path, default_prefix="image")[0]
+    reference = _python_reference_from_native_image_outputs(
+        runtime_engine,
+        item,
+        labels,
+        imgsz=(320, 320),
+        conf=TEST_CONF,
+        iou=0.45,
+        max_det=runtime_engine.metadata.max_det,
+        retina_masks=retina_masks,
+    )
+    actual = runtime_engine.predict(image_path, conf=TEST_CONF, imgsz=320, retina_masks=retina_masks)[0]
+
+    _assert_native_postprocess_matches_python_reference(actual, reference)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("retina_masks", [False, True])
+def test_native_postprocess_matches_python_reference_for_prepared_tensor(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+    retina_masks: bool,
+) -> None:
+    runtime_engine.clear_prompts()
+    labels = ["bus"]
+    runtime_engine.set_classes(labels)
+
+    image_path = test_images["bus"]
+    prepared = runtime_engine.prepare_cuda_input(image_path, imgsz=320)
+    reference = _python_reference_from_native_tensor_outputs(
+        runtime_engine,
+        prepared,
+        labels,
+        conf=TEST_CONF,
+        iou=0.45,
+        max_det=runtime_engine.metadata.max_det,
+        retina_masks=retina_masks,
+    )
+    actual = runtime_engine.predict(prepared, conf=TEST_CONF, retina_masks=retina_masks)[0]
+
+    _assert_native_postprocess_matches_python_reference(actual, reference)
+
+
+@pytest.mark.integration
+def test_native_postprocessed_results_do_not_alias_across_inferences(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+) -> None:
+    runtime_engine.clear_prompts()
+    runtime_engine.set_classes(["bus"])
+
+    first = runtime_engine.predict(test_images["bus"], conf=TEST_CONF, imgsz=320, retina_masks=True)[0]
+    assert first.boxes is not None
+    first_boxes = first.boxes.data.detach().cpu().clone()
+    first_masks = first.masks.data.detach().cpu().clone() if first.masks is not None else None
+
+    runtime_engine.clear_prompts()
+    runtime_engine.set_classes(["dog"])
+    _ = runtime_engine.predict(test_images["dog"], conf=TEST_CONF, imgsz=320, retina_masks=True)[0]
+
+    torch.testing.assert_close(first.boxes.data.detach().cpu(), first_boxes)
+    if first_masks is not None:
+        assert first.masks is not None
+        assert torch.equal(first.masks.data.detach().cpu(), first_masks)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("max_det", [0, -1])
+def test_native_postprocess_handles_nonpositive_max_det(
+    runtime_engine: YOLOEEngine,
+    test_images: dict[str, Path],
+    max_det: int,
+) -> None:
+    runtime_engine.clear_prompts()
+    runtime_engine.set_classes(["bus"])
+    native_runtime = runtime_engine.native_main_runtime
+    assert native_runtime is not None
+
+    item = normalize_source(test_images["bus"], default_prefix="image")[0]
+    native_outputs = native_runtime.infer_image_postprocessed(
+        item.image,
+        320,
+        320,
+        int(item.image.shape[0]),
+        int(item.image.shape[1]),
+        TEST_CONF,
+        0.45,
+        max_det,
+        False,
+    )
+    boxes = from_dlpack(native_outputs["boxes"])
+
+    assert tuple(boxes.shape) == (0, 6)
+    if "masks" in native_outputs:
+        masks = from_dlpack(native_outputs["masks"])
+        assert int(masks.shape[0]) == 0
 
 
 @pytest.mark.integration
