@@ -31,7 +31,7 @@ from .prompts import (
     load_prompt_projector,
     resolve_text_asset_path,
 )
-from .source import SourceItem, normalize_source
+from .source import PreparedFrameMetadata, SourceItem, normalize_source
 from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
 from .trt import TensorRTRuntime
 
@@ -452,12 +452,18 @@ class YOLOEEngine:
 
     def _resolve_original_sample(
         self,
-        original_image: SourceItem | object | None,
+        original_image: SourceItem | PreparedFrameMetadata | object | None,
         path: str | None,
         input_shape: tuple[int, int],
     ) -> SimpleNamespace:
         if isinstance(original_image, SourceItem):
             return SimpleNamespace(original=original_image.image, path=path or original_image.path)
+        if isinstance(original_image, PreparedFrameMetadata):
+            resolved_path = path or original_image.path or "tensor0"
+            if original_image.preview_image is not None:
+                return SimpleNamespace(original=original_image.preview_image, path=resolved_path)
+            fallback_image = np.zeros((*original_image.original_shape, 3), dtype=np.uint8)
+            return SimpleNamespace(original=fallback_image, path=resolved_path)
         if original_image is not None:
             item = normalize_source(original_image, default_prefix="tensor")[0]
             return SimpleNamespace(original=item.image, path=path or item.path)
@@ -583,18 +589,17 @@ class YOLOEEngine:
 
     def predict_item(
         self,
-        item: SourceItem,
+        item: InferenceSourceItem,
         imgsz: int | tuple[int, int] | list[int] | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
         retina_masks: bool = False,
     ) -> Results:
-        target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         resolved_max_det = int(max_det or self.metadata.max_det)
-        return self._predict_one(
+        return self._predict_input_entry(
             item=item,
-            imgsz=target_size,
+            imgsz=imgsz,
             conf=conf,
             iou=iou,
             max_det=resolved_max_det,

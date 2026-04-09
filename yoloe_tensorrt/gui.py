@@ -457,6 +457,11 @@ def run_camera_gui(
                 timeout_s=timeout_s,
                 prefix=prefix,
                 max_frames=max_frames,
+                zero_copy=None,
+                preview_cpu=True,
+                target_imgsz=target_size,
+                fp16=engine._main_fp16,
+                device=engine.device,
             )
 
         make_source = _make_source

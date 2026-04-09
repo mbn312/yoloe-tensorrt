@@ -7,7 +7,28 @@ import torch
 from ultralytics.engine.results import Results
 from yoloe_tensorrt.engine import YOLOEEngine
 from yoloe_tensorrt.inputs import PreparedTensorInput
-from yoloe_tensorrt.source import SourceItem
+from yoloe_tensorrt.source import PreparedFrameMetadata, SourceItem
+
+
+def test_resolve_original_sample_uses_prepared_frame_metadata_shape() -> None:
+    engine = object.__new__(YOLOEEngine)
+    metadata = PreparedFrameMetadata(original_shape=(720, 1280), path="camera_frame000001")
+
+    sample = engine._resolve_original_sample(metadata, None, (320, 320))
+
+    assert sample.path == "camera_frame000001"
+    assert sample.original.shape == (720, 1280, 3)
+
+
+def test_resolve_original_sample_prefers_prepared_frame_preview() -> None:
+    engine = object.__new__(YOLOEEngine)
+    preview = torch.zeros((5, 7, 3), dtype=torch.uint8).numpy()
+    metadata = PreparedFrameMetadata(original_shape=(5, 7), path="camera_frame000002", preview_image=preview)
+
+    sample = engine._resolve_original_sample(metadata, None, (320, 320))
+
+    assert sample.path == "camera_frame000002"
+    assert sample.original is preview
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for prepared-tensor stream handoff tests")

@@ -12,6 +12,7 @@ from PIL import Image
 from .gstreamer import camera_source_from_spec, is_rtsp_uri
 from .logging_utils import get_logger
 from .source import (
+    PreparedFrameMetadata,
     SourceItem,
     SourceStream,
     _is_iterable_source,
@@ -31,7 +32,7 @@ InputHint = Literal["auto", "raw", "prepared"]
 class PreparedTensorInput:
     tensor: torch.Tensor
     path: str
-    original_image: SourceItem | object | None = None
+    original_image: SourceItem | PreparedFrameMetadata | object | None = None
     producer_stream: int | None = None
 
     def __post_init__(self) -> None:

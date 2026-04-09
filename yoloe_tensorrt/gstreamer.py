@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from torch.utils.dlpack import from_dlpack
 
 from .logging_utils import get_logger
-from .source import SourceItem, SourceStream
+from .native_backend import JETSON_ZERO_COPY_AVAILABLE, build_native_jetson_camera_source
+from .preprocess import normalize_imgsz
+from .source import PreparedFrameMetadata, SourceItem, SourceStream
 
 LOGGER = get_logger(__name__)
 
@@ -90,6 +93,43 @@ def build_usb_camera_pipeline(
     return pipeline
 
 
+def build_zero_copy_usb_camera_pipeline(
+    device: str | Path = "/dev/video0",
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    prefer_mjpeg: bool = True,
+    io_mode: str = "mmap",
+    appsink_name: str = "sink",
+) -> str:
+    device_path = str(Path(device))
+    source = f"v4l2src device={device_path} io-mode={io_mode} do-timestamp=true"
+    caps_parts: list[str] = []
+    if width is not None:
+        caps_parts.append(f"width={int(width)}")
+    if height is not None:
+        caps_parts.append(f"height={int(height)}")
+    if fps is not None:
+        caps_parts.append(f"framerate={int(fps)}/1")
+
+    if prefer_mjpeg:
+        source_caps = "image/jpeg"
+        decode = "jpegparse ! nvv4l2decoder mjpeg=true enable-max-performance=true"
+    else:
+        source = f"nvv4l2camerasrc device={device_path} do-timestamp=true"
+        source_caps = "video/x-raw(memory:NVMM),format=UYVY"
+        decode = "nvvidconv"
+
+    if caps_parts:
+        source_caps += "," + ",".join(caps_parts)
+
+    return (
+        f"{source} ! {source_caps} ! {decode} ! "
+        f"video/x-raw(memory:NVMM),format=BGRx ! "
+        f"appsink name={appsink_name} emit-signals=false max-buffers=1 drop=true sync=false"
+    )
+
+
 def build_rtsp_pipeline(
     uri: str,
     width: int | None = None,
@@ -120,6 +160,29 @@ def build_rtsp_pipeline(
     return pipeline
 
 
+def build_zero_copy_rtsp_pipeline(
+    uri: str,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    appsink_name: str = "sink",
+) -> str:
+    caps = ["video/x-raw(memory:NVMM),format=BGRx"]
+    if width is not None:
+        caps.append(f"width={int(width)}")
+    if height is not None:
+        caps.append(f"height={int(height)}")
+    if fps is not None:
+        caps.append(f"framerate={int(fps)}/1")
+    return (
+        f"uridecodebin uri={_gst_quote(str(uri).strip())} use-buffering=false ! "
+        "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        "nvvidconv ! "
+        f"{','.join(caps)} ! "
+        f"appsink name={appsink_name} emit-signals=false max-buffers=1 drop=true sync=false"
+    )
+
+
 def build_dummy_video_pipeline(
     width: int = 640,
     height: int = 480,
@@ -145,14 +208,22 @@ def camera_source_from_spec(
     timeout_s: float = 5.0,
     prefix: str = "camera",
     max_frames: int | None = None,
-) -> GStreamerSource:
+    zero_copy: bool | None = None,
+    preview_cpu: bool = False,
+    target_imgsz: int | tuple[int, int] | list[int] | None = None,
+    fp16: bool = False,
+    device: str | int = "cuda:0",
+) -> SourceStream:
     source_text = str(source_value).strip()
     lowered = source_text.lower()
     resolved_width = 640 if width is None else int(width)
     resolved_height = 480 if height is None else int(height)
     resolved_fps = 30 if fps is None else int(fps)
+    fallback_source: SourceStream
+    zero_copy_pipeline: str | None = None
+    zero_copy_supported = False
     if is_rtsp_uri(source_text):
-        return GStreamerSource.rtsp(
+        fallback_source = GStreamerSource.rtsp(
             source_text,
             width=width,
             height=height,
@@ -161,17 +232,26 @@ def camera_source_from_spec(
             timeout_s=timeout_s,
             prefix=prefix,
         )
-    if "!" in source_text:
-        return GStreamerSource(
+        zero_copy_pipeline = build_zero_copy_rtsp_pipeline(
+            source_text,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        zero_copy_supported = True
+    elif "!" in source_text:
+        fallback_source = GStreamerSource(
             pipeline=source_text,
             prefix=prefix,
             max_frames=max_frames,
             timeout_s=timeout_s,
         )
-    if lowered in {"dummy", "videotest", "videotestsrc"} or lowered.startswith(("dummy://", "videotest://")):
+        zero_copy_pipeline = source_text
+        zero_copy_supported = True
+    elif lowered in {"dummy", "videotest", "videotestsrc"} or lowered.startswith(("dummy://", "videotest://")):
         pattern = source_text.split("://", 1)[1].strip() if "://" in source_text else "ball"
         pattern = pattern or "ball"
-        return GStreamerSource(
+        fallback_source = GStreamerSource(
             pipeline=build_dummy_video_pipeline(
                 width=resolved_width,
                 height=resolved_height,
@@ -182,18 +262,49 @@ def camera_source_from_spec(
             max_frames=max_frames,
             timeout_s=timeout_s,
         )
+    else:
+        device_path = Path(source_text)
+        if not device_path.exists():
+            raise FileNotFoundError(f"Camera source device is missing: {device_path}")
+        fallback_source = GStreamerSource.usb_camera(
+            device=device_path,
+            width=resolved_width,
+            height=resolved_height,
+            fps=resolved_fps,
+            max_frames=max_frames,
+            timeout_s=timeout_s,
+            prefix=prefix,
+        )
+        zero_copy_pipeline = build_zero_copy_usb_camera_pipeline(
+            device=device_path,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        zero_copy_supported = True
 
-    device_path = Path(source_text)
-    if not device_path.exists():
-        raise FileNotFoundError(f"Camera source device is missing: {device_path}")
-    return GStreamerSource.usb_camera(
-        device=device_path,
-        width=resolved_width,
-        height=resolved_height,
-        fps=resolved_fps,
+    if zero_copy is False or not zero_copy_supported:
+        return fallback_source
+    if target_imgsz is None:
+        if zero_copy is True:
+            raise ValueError("zero_copy camera sources require target_imgsz so frames can be prepared for inference")
+        return fallback_source
+    if not JETSON_ZERO_COPY_AVAILABLE:
+        if zero_copy is True:
+            raise RuntimeError("Jetson zero-copy camera ingest is unavailable in the current native build")
+        return fallback_source
+
+    return JetsonZeroCopySource(
+        pipeline=str(zero_copy_pipeline),
+        prefix=prefix,
+        target_imgsz=normalize_imgsz(target_imgsz),
+        fp16=bool(fp16),
+        preview_cpu=preview_cpu,
         max_frames=max_frames,
         timeout_s=timeout_s,
-        prefix=prefix,
+        device=device,
+        fallback_source=None if zero_copy else fallback_source,
+        required=bool(zero_copy),
     )
 
 
@@ -316,6 +427,82 @@ class GStreamerSource(SourceStream):
             pipeline.get_state(self.timeout_ns)
             pipeline = None
             LOGGER.info("Closed GStreamer source '%s'", self.prefix)
+
+
+@dataclass
+class JetsonZeroCopySource(SourceStream):
+    pipeline: str
+    prefix: str
+    target_imgsz: tuple[int, int]
+    fp16: bool
+    preview_cpu: bool = False
+    max_frames: int | None = None
+    timeout_s: float = 5.0
+    device: str | int = "cuda:0"
+    fallback_source: SourceStream | None = None
+    required: bool = False
+    is_live_source: bool = True
+
+    def __iter__(self):
+        from .inputs import PreparedTensorInput
+
+        native_source = build_native_jetson_camera_source(
+            self.pipeline,
+            prefix=self.prefix,
+            timeout_s=self.timeout_s,
+            target_h=int(self.target_imgsz[0]),
+            target_w=int(self.target_imgsz[1]),
+            fp16=self.fp16,
+            preview_cpu=self.preview_cpu,
+            device=self.device,
+        )
+        if native_source is None:
+            if self.fallback_source is not None and not self.required:
+                LOGGER.info(
+                    "Zero-copy camera backend unavailable for '%s'; falling back to CPU appsink path",
+                    self.prefix,
+                )
+                yield from self.fallback_source
+                return
+            raise RuntimeError("Jetson zero-copy camera ingest is unavailable in the current native build")
+
+        LOGGER.info("Opening Jetson zero-copy source '%s' with pipeline: %s", self.prefix, self.pipeline)
+        frame_index = 0
+        yielded_any = False
+        try:
+            while self.max_frames is None or frame_index < self.max_frames:
+                frame = native_source.read_frame()
+                if frame is None:
+                    break
+                yielded_any = True
+                path = str(frame["path"])
+                preview_image = frame.get("preview")
+                metadata = PreparedFrameMetadata(
+                    original_shape=tuple(int(v) for v in frame["original_shape"]),
+                    path=path,
+                    preview_image=preview_image,
+                )
+                yield PreparedTensorInput(
+                    tensor=from_dlpack(frame["tensor"]),
+                    path=path,
+                    original_image=metadata,
+                    producer_stream=int(frame["producer_stream"]),
+                )
+                frame_index += 1
+        except Exception:
+            native_source.close()
+            if not yielded_any and self.fallback_source is not None and not self.required:
+                LOGGER.warning(
+                    "Zero-copy startup failed for '%s'; falling back to CPU appsink path",
+                    self.prefix,
+                    exc_info=True,
+                )
+                yield from self.fallback_source
+                return
+            raise
+        finally:
+            native_source.close()
+            LOGGER.info("Closed Jetson zero-copy source '%s'", self.prefix)
 
 
 def _sample_to_bgr(sample, GstVideo) -> np.ndarray:

@@ -35,6 +35,6 @@ track IDs when detections are matched across frames.
 - raw GStreamer pipeline strings are also accepted
 - `videotest://<pattern>` creates a synthetic GStreamer source, for example `videotest://ball` or `videotest://smpte`
 
-## Current limitation
+## Jetson zero-copy path
 
-The camera path still uses an appsink/CPU-memory ingest path. Jetson zero-copy NVMM/EGL/CUDA ingest is still roadmap work.
+On Jetson builds that include the native camera backend, the GUI requests the zero-copy NVMM/EGL/CUDA ingest path automatically and only materializes a CPU preview frame for rendering the window. If zero-copy is unavailable or the source cannot negotiate the required NVMM pipeline, the GUI falls back to the existing CPU appsink path.

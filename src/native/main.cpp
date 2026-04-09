@@ -5,6 +5,19 @@
 #include <NvInferRuntime.h>
 #include <opencv2/imgproc.hpp>
 
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+#include "jetson_camera_kernels.h"
+
+#include <EGL/egl.h>
+#include <cuda.h>
+#include <cudaEGL.h>
+#include <gst/allocators/gstdmabuf.h>
+#include <gst/app/gstappsink.h>
+#include <gst/gst.h>
+#include <gst/video/video.h>
+#include <NvBufSurface.h>
+#endif
+
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -15,7 +28,9 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -193,12 +208,130 @@ struct BindingInfo {
 };
 
 class NativeMainRuntime;
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+class NativeJetsonCameraSource;
+#endif
 
 struct ManagedTensorContext {
     std::shared_ptr<NativeMainRuntime> owner;
     std::vector<std::int64_t> shape;
     DLManagedTensor managed{};
 };
+
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+struct PendingJetsonFrame {
+    CudaBuffer output_buffer;
+    GstSample* sample = nullptr;
+    NvBufSurface* surface = nullptr;
+    bool mapped_egl = false;
+    CUgraphicsResource resource = nullptr;
+    cudaEvent_t ready_event = nullptr;
+    int device_id = 0;
+
+    PendingJetsonFrame() = default;
+    PendingJetsonFrame(PendingJetsonFrame const&) = delete;
+    PendingJetsonFrame& operator=(PendingJetsonFrame const&) = delete;
+
+    ~PendingJetsonFrame()
+    {
+        release_frame_resources();
+    }
+
+    void record_ready_event(cudaStream_t stream)
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id), "cudaSetDevice failed for zero-copy frame event");
+        throw_if_cuda_failed(
+            cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming),
+            "cudaEventCreateWithFlags failed for zero-copy frame event");
+        try {
+            throw_if_cuda_failed(
+                cudaEventRecord(ready_event, stream),
+                "cudaEventRecord failed for zero-copy frame event");
+        } catch (...) {
+            cudaEventDestroy(ready_event);
+            ready_event = nullptr;
+            throw;
+        }
+    }
+
+    void wait_on_consumer_stream(cudaStream_t consumer_stream) const
+    {
+        if (ready_event == nullptr) {
+            return;
+        }
+        throw_if_cuda_failed(cudaSetDevice(device_id), "cudaSetDevice failed for zero-copy DLPack handoff");
+        throw_if_cuda_failed(
+            cudaStreamWaitEvent(consumer_stream, ready_event, 0),
+            "cudaStreamWaitEvent failed for zero-copy DLPack handoff");
+    }
+
+    bool is_ready() const
+    {
+        if (ready_event == nullptr) {
+            return true;
+        }
+        auto const status = cudaEventQuery(ready_event);
+        if (status == cudaSuccess) {
+            return true;
+        }
+        if (status == cudaErrorNotReady) {
+            cudaGetLastError();
+            return false;
+        }
+        throw std::runtime_error(std::string("cudaEventQuery failed for zero-copy frame event: ") + cudaGetErrorString(status));
+    }
+
+    void release_frame_resources() noexcept
+    {
+        if (device_id >= 0) {
+            cudaSetDevice(device_id);
+        }
+        if (resource != nullptr) {
+            cuGraphicsUnregisterResource(resource);
+            resource = nullptr;
+        }
+        if (mapped_egl && surface != nullptr) {
+            NvBufSurfaceUnMapEglImage(surface, 0);
+            mapped_egl = false;
+        }
+        if (ready_event != nullptr) {
+            cudaEventDestroy(ready_event);
+            ready_event = nullptr;
+        }
+        if (sample != nullptr) {
+            gst_sample_unref(sample);
+            sample = nullptr;
+        }
+        surface = nullptr;
+    }
+};
+
+struct ManagedCameraTensorContext {
+    std::shared_ptr<NativeJetsonCameraSource> owner;
+    std::shared_ptr<PendingJetsonFrame> frame;
+    std::vector<std::int64_t> shape;
+    DLManagedTensor managed{};
+};
+
+inline cudaStream_t parse_dlpack_consumer_stream(py::object const& stream)
+{
+    if (stream.is_none()) {
+        return cudaStreamLegacy;
+    }
+
+    auto const value = stream.cast<std::int64_t>();
+    if (value == 1) {
+        return cudaStreamLegacy;
+    }
+    if (value == 2) {
+        return cudaStreamPerThread;
+    }
+    if (value == 0 || value < 0) {
+        throw std::runtime_error("Invalid CUDA DLPack consumer stream value");
+    }
+    return reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(value));
+}
+#endif
 
 class CudaTensorView {
 public:
@@ -257,6 +390,73 @@ private:
     nvinfer1::DataType dtype_ = nvinfer1::DataType::kFLOAT;
     int device_id_ = 0;
 };
+
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+class CameraCudaTensorView {
+public:
+    CameraCudaTensorView(
+        std::shared_ptr<NativeJetsonCameraSource> owner,
+        std::shared_ptr<PendingJetsonFrame> frame,
+        void* ptr,
+        std::vector<std::int64_t> shape,
+        nvinfer1::DataType dtype,
+        int device_id)
+        : owner_(std::move(owner))
+        , frame_(std::move(frame))
+        , ptr_(ptr)
+        , shape_(std::move(shape))
+        , dtype_(dtype)
+        , device_id_(device_id)
+    {
+    }
+
+    py::capsule dlpack(py::object stream) const
+    {
+        if (frame_ != nullptr) {
+            frame_->wait_on_consumer_stream(parse_dlpack_consumer_stream(stream));
+        }
+        auto* ctx = new ManagedCameraTensorContext();
+        ctx->owner = owner_;
+        ctx->frame = frame_;
+        ctx->shape = shape_;
+        ctx->managed.manager_ctx = ctx;
+        ctx->managed.deleter = [](DLManagedTensor* self) {
+            auto* managed_ctx = static_cast<ManagedCameraTensorContext*>(self->manager_ctx);
+            delete managed_ctx;
+        };
+        ctx->managed.dl_tensor.data = ptr_;
+        ctx->managed.dl_tensor.device = DLDevice{kDLCUDA, device_id_};
+        ctx->managed.dl_tensor.ndim = static_cast<int>(ctx->shape.size());
+        ctx->managed.dl_tensor.dtype = to_dlpack_dtype(dtype_);
+        ctx->managed.dl_tensor.shape = ctx->shape.data();
+        ctx->managed.dl_tensor.strides = nullptr;
+        ctx->managed.dl_tensor.byte_offset = 0;
+
+        py::capsule capsule(&ctx->managed, "dltensor", [](PyObject* obj) {
+            if (PyCapsule_IsValid(obj, "dltensor")) {
+                auto* managed = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, "dltensor"));
+                if (managed != nullptr && managed->deleter != nullptr) {
+                    managed->deleter(managed);
+                }
+            }
+        });
+        return capsule;
+    }
+
+    py::tuple dlpack_device() const
+    {
+        return py::make_tuple(static_cast<int>(kDLCUDA), device_id_);
+    }
+
+private:
+    std::shared_ptr<NativeJetsonCameraSource> owner_;
+    std::shared_ptr<PendingJetsonFrame> frame_;
+    void* ptr_ = nullptr;
+    std::vector<std::int64_t> shape_;
+    nvinfer1::DataType dtype_ = nvinfer1::DataType::kFLOAT;
+    int device_id_ = 0;
+};
+#endif
 
 class NativeMainRuntime : public std::enable_shared_from_this<NativeMainRuntime> {
 public:
@@ -716,6 +916,398 @@ private:
     std::vector<__half> prompt_half_host_;
 };
 
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+void ensure_gstreamer_initialized()
+{
+    static std::once_flag init_flag;
+    std::call_once(init_flag, []() {
+        gst_init(nullptr, nullptr);
+    });
+}
+
+class NativeJetsonCameraSource : public std::enable_shared_from_this<NativeJetsonCameraSource> {
+public:
+    NativeJetsonCameraSource(
+        std::string pipeline,
+        std::string prefix,
+        double timeout_s,
+        int target_h,
+        int target_w,
+        bool fp16,
+        bool preview_cpu,
+        int device_id)
+        : pipeline_spec_(std::move(pipeline))
+        , prefix_(std::move(prefix))
+        , timeout_ns_(static_cast<GstClockTime>(timeout_s * 1'000'000'000.0))
+        , target_h_(target_h)
+        , target_w_(target_w)
+        , fp16_(fp16)
+        , preview_cpu_(preview_cpu)
+        , device_id_(device_id)
+        , output_dtype_(fp16 ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT)
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id_), "cudaSetDevice failed");
+        throw_if_cuda_failed(cudaStreamCreate(&stream_), "cudaStreamCreate failed");
+    }
+
+    ~NativeJetsonCameraSource()
+    {
+        close();
+        if (stream_ != nullptr) {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
+    }
+
+    py::object read_frame()
+    {
+        open_if_needed();
+        cleanup_completed_frames();
+
+        GstSample* sample = gst_app_sink_try_pull_sample(appsink_, timeout_ns_);
+        if (sample == nullptr) {
+            if (gst_app_sink_is_eos(appsink_)) {
+                return py::none();
+            }
+            if (auto* message = gst_bus_timed_pop_filtered(bus_, 0, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_WARNING))) {
+                if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+                    GError* error = nullptr;
+                    gchar* debug = nullptr;
+                    gst_message_parse_error(message, &error, &debug);
+                    std::string message_text = error != nullptr ? error->message : "unknown";
+                    std::string debug_text = debug != nullptr ? debug : "";
+                    if (error != nullptr) {
+                        g_error_free(error);
+                    }
+                    if (debug != nullptr) {
+                        g_free(debug);
+                    }
+                    gst_message_unref(message);
+                    throw std::runtime_error("GStreamer source error: " + message_text + "; debug=" + debug_text);
+                }
+                if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS) {
+                    gst_message_unref(message);
+                    return py::none();
+                }
+                gst_message_unref(message);
+            }
+            throw std::runtime_error("Timed out waiting for a frame from zero-copy GStreamer source");
+        }
+
+        return frame_from_sample(sample);
+    }
+
+    void close()
+    {
+        if (stream_ != nullptr) {
+            cudaSetDevice(device_id_);
+            cudaStreamSynchronize(stream_);
+        }
+        while (!pending_frames_.empty()) {
+            pending_frames_.front()->release_frame_resources();
+            pending_frames_.pop_front();
+        }
+        reusable_frames_.clear();
+        if (pipeline_ != nullptr) {
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+            gst_element_get_state(pipeline_, nullptr, nullptr, timeout_ns_);
+        }
+        if (appsink_ != nullptr) {
+            gst_object_unref(appsink_);
+            appsink_ = nullptr;
+        }
+        if (bus_ != nullptr) {
+            gst_object_unref(bus_);
+            bus_ = nullptr;
+        }
+        if (pipeline_ != nullptr) {
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+        }
+        frame_index_ = 0;
+        started_ = false;
+    }
+
+private:
+    std::shared_ptr<PendingJetsonFrame> acquire_frame_slot(std::size_t bytes)
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id_), "cudaSetDevice failed during zero-copy frame allocation");
+        while (!reusable_frames_.empty()) {
+            auto frame = reusable_frames_.front();
+            reusable_frames_.pop_front();
+            if (frame.use_count() != 1) {
+                continue;
+            }
+            frame->output_buffer.ensure(bytes);
+            return frame;
+        }
+
+        auto frame = std::make_shared<PendingJetsonFrame>();
+        frame->device_id = device_id_;
+        frame->output_buffer.ensure(bytes);
+        return frame;
+    }
+
+    void cleanup_completed_frames()
+    {
+        throw_if_cuda_failed(cudaSetDevice(device_id_), "cudaSetDevice failed during zero-copy frame cleanup");
+        while (!pending_frames_.empty()) {
+            auto frame = pending_frames_.front();
+            if (!frame->is_ready()) {
+                break;
+            }
+            frame->release_frame_resources();
+            pending_frames_.pop_front();
+            if (frame.use_count() == 1) {
+                reusable_frames_.push_back(std::move(frame));
+            }
+        }
+    }
+
+    void open_if_needed()
+    {
+        if (started_) {
+            return;
+        }
+
+        ensure_gstreamer_initialized();
+
+        GError* error = nullptr;
+        pipeline_ = gst_parse_launch(pipeline_spec_.c_str(), &error);
+        if (pipeline_ == nullptr) {
+            std::string message = error != nullptr ? error->message : "unknown";
+            if (error != nullptr) {
+                g_error_free(error);
+            }
+            throw std::runtime_error("Unable to parse GStreamer pipeline: " + message);
+        }
+
+        auto* appsink_element = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
+        if (appsink_element == nullptr) {
+            close();
+            throw std::runtime_error("GStreamer pipeline did not expose appsink 'sink': " + pipeline_spec_);
+        }
+        if (!GST_IS_APP_SINK(appsink_element)) {
+            gst_object_unref(appsink_element);
+            close();
+            throw std::runtime_error("Pipeline element 'sink' is not a GstAppSink");
+        }
+        appsink_ = GST_APP_SINK(appsink_element);
+        bus_ = gst_element_get_bus(pipeline_);
+
+        if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            close();
+            throw std::runtime_error("Unable to start GStreamer pipeline: " + pipeline_spec_);
+        }
+        gst_element_get_state(pipeline_, nullptr, nullptr, timeout_ns_);
+        started_ = true;
+    }
+
+    py::array preview_from_surface(NvBufSurface* surface, int width, int height, bool input_is_bgrx)
+    {
+        if (!preview_cpu_) {
+            return py::array();
+        }
+        if (NvBufSurfaceMap(surface, 0, 0, NVBUF_MAP_READ) != 0) {
+            throw std::runtime_error("NvBufSurfaceMap failed for preview frame");
+        }
+        if (NvBufSurfaceSyncForCpu(surface, 0, 0) != 0) {
+            NvBufSurfaceUnMap(surface, 0, 0);
+            throw std::runtime_error("NvBufSurfaceSyncForCpu failed for preview frame");
+        }
+
+        try {
+            auto* mapped = static_cast<unsigned char*>(surface->surfaceList[0].mappedAddr.addr[0]);
+            int const pitch = static_cast<int>(surface->surfaceList[0].pitch);
+            if (mapped == nullptr || pitch <= 0) {
+                throw std::runtime_error("Preview frame did not expose CPU-mappable image data");
+            }
+            cv::Mat const src(height, width, CV_8UC4, mapped, static_cast<std::size_t>(pitch));
+            cv::Mat bgr;
+            cv::cvtColor(src, bgr, input_is_bgrx ? cv::COLOR_BGRA2BGR : cv::COLOR_RGBA2BGR);
+            py::array_t<std::uint8_t> array({ bgr.rows, bgr.cols, bgr.channels() });
+            auto const info = array.request();
+            std::memcpy(info.ptr, bgr.data, static_cast<std::size_t>(bgr.rows * bgr.cols * bgr.channels()));
+            NvBufSurfaceUnMap(surface, 0, 0);
+            return array;
+        } catch (...) {
+            NvBufSurfaceUnMap(surface, 0, 0);
+            throw;
+        }
+    }
+
+    py::dict frame_from_sample(GstSample* sample)
+    {
+        auto* caps = gst_sample_get_caps(sample);
+        if (caps == nullptr) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("GStreamer sample did not include caps");
+        }
+        auto* structure = gst_caps_get_structure(caps, 0);
+        int width = 0;
+        int height = 0;
+        if (!gst_structure_get_int(structure, "width", &width) || !gst_structure_get_int(structure, "height", &height)) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("Unable to read GStreamer frame dimensions");
+        }
+        char const* format_name = gst_structure_get_string(structure, "format");
+        if (format_name == nullptr) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("Unable to read GStreamer frame format");
+        }
+        bool const input_is_bgrx = std::string(format_name) == "BGRx";
+        if (!input_is_bgrx && std::string(format_name) != "RGBA") {
+            gst_sample_unref(sample);
+            throw std::runtime_error("Zero-copy source expects BGRx or RGBA NVMM frames, got: " + std::string(format_name));
+        }
+
+        auto* buffer = gst_sample_get_buffer(sample);
+        if (buffer == nullptr || gst_buffer_n_memory(buffer) <= 0) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("GStreamer sample did not include a buffer");
+        }
+        auto* memory = gst_buffer_peek_memory(buffer, 0);
+        if (memory == nullptr || !gst_is_dmabuf_memory(memory)) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("Zero-copy camera source requires DMABUF-backed NVMM frames");
+        }
+        int const dmabuf_fd = gst_dmabuf_memory_get_fd(memory);
+        if (dmabuf_fd < 0) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("Unable to extract DMABUF fd from GStreamer sample");
+        }
+
+        NvBufSurface* surface = nullptr;
+        if (NvBufSurfaceFromFd(dmabuf_fd, reinterpret_cast<void**>(&surface)) != 0 || surface == nullptr) {
+            gst_sample_unref(sample);
+            throw std::runtime_error("NvBufSurfaceFromFd failed for zero-copy frame");
+        }
+
+        py::object preview = py::none();
+        if (preview_cpu_) {
+            try {
+                preview = preview_from_surface(surface, width, height, input_is_bgrx);
+            } catch (...) {
+                gst_sample_unref(sample);
+                throw;
+            }
+        }
+
+        bool mapped_egl = false;
+        if (surface->surfaceList[0].mappedAddr.eglImage == nullptr) {
+            if (NvBufSurfaceMapEglImage(surface, 0) != 0) {
+                gst_sample_unref(sample);
+                throw std::runtime_error("NvBufSurfaceMapEglImage failed for zero-copy frame");
+            }
+            mapped_egl = true;
+        }
+
+        auto egl_image = surface->surfaceList[0].mappedAddr.eglImage;
+        if (egl_image == nullptr) {
+            if (mapped_egl) {
+                NvBufSurfaceUnMapEglImage(surface, 0);
+            }
+            gst_sample_unref(sample);
+            throw std::runtime_error("EGL image was unavailable for zero-copy frame");
+        }
+
+        CUgraphicsResource resource = nullptr;
+        CUeglFrame egl_frame{};
+        cudaFree(0);
+        if (cuGraphicsEGLRegisterImage(&resource, egl_image, CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS) {
+            if (mapped_egl) {
+                NvBufSurfaceUnMapEglImage(surface, 0);
+            }
+            gst_sample_unref(sample);
+            throw std::runtime_error("cuGraphicsEGLRegisterImage failed for zero-copy frame");
+        }
+
+        try {
+            if (cuGraphicsResourceGetMappedEglFrame(&egl_frame, resource, 0, 0) != CUDA_SUCCESS) {
+                throw std::runtime_error("cuGraphicsResourceGetMappedEglFrame failed for zero-copy frame");
+            }
+            if (egl_frame.frameType != CU_EGL_FRAME_TYPE_PITCH) {
+                throw std::runtime_error("Zero-copy source only supports pitch-linear EGL frames");
+            }
+
+            auto const plane_elements = static_cast<std::size_t>(target_h_) * static_cast<std::size_t>(target_w_) * 3U;
+            auto pending_frame = acquire_frame_slot(plane_elements * dtype_size(output_dtype_));
+            launch_jetson_zero_copy_preprocess(
+                egl_frame.frame.pPitch[0],
+                width,
+                height,
+                static_cast<int>(egl_frame.pitch),
+                target_w_,
+                target_h_,
+                input_is_bgrx,
+                fp16_,
+                pending_frame->output_buffer.data(),
+                stream_);
+            throw_if_cuda_failed(cudaGetLastError(), "Jetson zero-copy preprocess kernel launch failed");
+
+            pending_frame->record_ready_event(stream_);
+            pending_frame->sample = sample;
+            pending_frame->surface = surface;
+            pending_frame->mapped_egl = mapped_egl;
+            pending_frame->resource = resource;
+            pending_frames_.push_back(pending_frame);
+            sample = nullptr;
+            surface = nullptr;
+            mapped_egl = false;
+            resource = nullptr;
+
+            py::dict result;
+            result["tensor"] = CameraCudaTensorView(
+                shared_from_this(),
+                pending_frame,
+                pending_frame->output_buffer.data(),
+                { 1, 3, target_h_, target_w_ },
+                output_dtype_,
+                device_id_);
+            result["path"] = prefix_ + "_frame" + [&]() {
+                char buffer[32];
+                std::snprintf(buffer, sizeof(buffer), "%06zu", frame_index_);
+                return std::string(buffer);
+            }();
+            result["original_shape"] = py::make_tuple(height, width);
+            result["producer_stream"] = reinterpret_cast<std::uintptr_t>(stream_);
+            result["preview"] = preview;
+            ++frame_index_;
+            return result;
+        } catch (...) {
+            if (resource != nullptr) {
+                cuGraphicsUnregisterResource(resource);
+            }
+            if (mapped_egl && surface != nullptr) {
+                NvBufSurfaceUnMapEglImage(surface, 0);
+            }
+            if (sample != nullptr) {
+                gst_sample_unref(sample);
+            }
+            throw;
+        }
+    }
+
+    std::string pipeline_spec_;
+    std::string prefix_;
+    GstClockTime timeout_ns_ = 0;
+    int target_h_ = 0;
+    int target_w_ = 0;
+    bool fp16_ = false;
+    bool preview_cpu_ = false;
+    int device_id_ = 0;
+    nvinfer1::DataType output_dtype_ = nvinfer1::DataType::kFLOAT;
+    cudaStream_t stream_ = nullptr;
+    GstElement* pipeline_ = nullptr;
+    GstAppSink* appsink_ = nullptr;
+    GstBus* bus_ = nullptr;
+    bool started_ = false;
+    std::size_t frame_index_ = 0;
+    std::deque<std::shared_ptr<PendingJetsonFrame>> pending_frames_;
+    std::deque<std::shared_ptr<PendingJetsonFrame>> reusable_frames_;
+};
+#endif
+
 } // namespace
 
 PYBIND11_MODULE(_native, m)
@@ -725,6 +1317,12 @@ PYBIND11_MODULE(_native, m)
     py::class_<CudaTensorView>(m, "CudaTensorView")
         .def("__dlpack__", [](CudaTensorView const& self, py::object) { return self.dlpack(); }, py::arg("stream") = py::none())
         .def("__dlpack_device__", &CudaTensorView::dlpack_device);
+
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+    py::class_<CameraCudaTensorView>(m, "CameraCudaTensorView")
+        .def("__dlpack__", [](CameraCudaTensorView const& self, py::object stream) { return self.dlpack(std::move(stream)); }, py::arg("stream") = py::none())
+        .def("__dlpack_device__", &CameraCudaTensorView::dlpack_device);
+#endif
 
     py::class_<NativeMainRuntime, std::shared_ptr<NativeMainRuntime>>(m, "NativeMainRuntime")
         .def(py::init<std::string, std::string, std::string, int>(), py::arg("engine_path"), py::arg("image_input_name"), py::arg("prompt_input_name"), py::arg("device_id") = 0)
@@ -741,4 +1339,20 @@ PYBIND11_MODULE(_native, m)
             py::arg("target_w"),
             py::arg("producer_stream") = 0)
         .def("warmup", &NativeMainRuntime::warmup, py::arg("target_h"), py::arg("target_w"), py::arg("prompt_count"), py::arg("runs") = 2);
+
+#ifdef YOLOE_TRT_ENABLE_JETSON_CAMERA
+    py::class_<NativeJetsonCameraSource, std::shared_ptr<NativeJetsonCameraSource>>(m, "NativeJetsonCameraSource")
+        .def(
+            py::init<std::string, std::string, double, int, int, bool, bool, int>(),
+            py::arg("pipeline"),
+            py::arg("prefix"),
+            py::arg("timeout_s"),
+            py::arg("target_h"),
+            py::arg("target_w"),
+            py::arg("fp16"),
+            py::arg("preview_cpu") = false,
+            py::arg("device_id") = 0)
+        .def("read_frame", &NativeJetsonCameraSource::read_frame)
+        .def("close", &NativeJetsonCameraSource::close);
+#endif
 }
