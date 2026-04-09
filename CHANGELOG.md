@@ -12,6 +12,7 @@
 - Expanded runtime and unit coverage for unified routing, benchmark CLI help, tracker-session input handling, and prepared-tensor regressions.
 - Added first-class RTSP input support so plain `rtsp://...` and `rtsps://...` sources can be used without writing a custom GStreamer pipeline.
 - Added an optional Jetson zero-copy camera ingest path that maps NVMM frames through EGL/CUDA, emits prepared tensors for inference, and falls back to the CPU appsink path when zero-copy is unavailable.
+- Updated GUI
 
 ## 0.1.3
 

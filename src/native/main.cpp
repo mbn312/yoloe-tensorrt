@@ -222,6 +222,9 @@ struct ManagedTensorContext {
 struct PendingJetsonFrame {
     CudaBuffer output_buffer;
     GstSample* sample = nullptr;
+    GstBuffer* mapped_buffer = nullptr;
+    GstMapInfo mapped_buffer_info{};
+    bool buffer_mapped = false;
     NvBufSurface* surface = nullptr;
     bool mapped_egl = false;
     CUgraphicsResource resource = nullptr;
@@ -293,6 +296,11 @@ struct PendingJetsonFrame {
         if (mapped_egl && surface != nullptr) {
             NvBufSurfaceUnMapEglImage(surface, 0);
             mapped_egl = false;
+        }
+        if (buffer_mapped && mapped_buffer != nullptr) {
+            gst_buffer_unmap(mapped_buffer, &mapped_buffer_info);
+            mapped_buffer = nullptr;
+            buffer_mapped = false;
         }
         if (ready_event != nullptr) {
             cudaEventDestroy(ready_event);
@@ -1166,21 +1174,39 @@ private:
             gst_sample_unref(sample);
             throw std::runtime_error("GStreamer sample did not include a buffer");
         }
-        auto* memory = gst_buffer_peek_memory(buffer, 0);
-        if (memory == nullptr || !gst_is_dmabuf_memory(memory)) {
-            gst_sample_unref(sample);
-            throw std::runtime_error("Zero-copy camera source requires DMABUF-backed NVMM frames");
-        }
-        int const dmabuf_fd = gst_dmabuf_memory_get_fd(memory);
-        if (dmabuf_fd < 0) {
-            gst_sample_unref(sample);
-            throw std::runtime_error("Unable to extract DMABUF fd from GStreamer sample");
-        }
-
         NvBufSurface* surface = nullptr;
-        if (NvBufSurfaceFromFd(dmabuf_fd, reinterpret_cast<void**>(&surface)) != 0 || surface == nullptr) {
-            gst_sample_unref(sample);
-            throw std::runtime_error("NvBufSurfaceFromFd failed for zero-copy frame");
+        GstBuffer* mapped_buffer = nullptr;
+        GstMapInfo mapped_buffer_info{};
+        bool buffer_mapped = false;
+        auto* memory = gst_buffer_peek_memory(buffer, 0);
+        if (memory != nullptr && gst_is_dmabuf_memory(memory)) {
+            int const dmabuf_fd = gst_dmabuf_memory_get_fd(memory);
+            if (dmabuf_fd < 0) {
+                gst_sample_unref(sample);
+                throw std::runtime_error("Unable to extract DMABUF fd from GStreamer sample");
+            }
+            if (NvBufSurfaceFromFd(dmabuf_fd, reinterpret_cast<void**>(&surface)) != 0 || surface == nullptr) {
+                gst_sample_unref(sample);
+                throw std::runtime_error("NvBufSurfaceFromFd failed for zero-copy frame");
+            }
+        } else {
+            if (!gst_buffer_map(buffer, &mapped_buffer_info, GST_MAP_READ)) {
+                gst_sample_unref(sample);
+                throw std::runtime_error("Unable to map zero-copy GstBuffer");
+            }
+            mapped_buffer = buffer;
+            buffer_mapped = true;
+            if (mapped_buffer_info.size < sizeof(NvBufSurface)) {
+                gst_buffer_unmap(mapped_buffer, &mapped_buffer_info);
+                gst_sample_unref(sample);
+                throw std::runtime_error("Zero-copy GstBuffer did not expose an NvBufSurface payload");
+            }
+            surface = reinterpret_cast<NvBufSurface*>(mapped_buffer_info.data);
+            if (surface == nullptr) {
+                gst_buffer_unmap(mapped_buffer, &mapped_buffer_info);
+                gst_sample_unref(sample);
+                throw std::runtime_error("Mapped zero-copy GstBuffer did not expose a valid NvBufSurface");
+            }
         }
 
         py::object preview = py::none();
@@ -1247,11 +1273,16 @@ private:
 
             pending_frame->record_ready_event(stream_);
             pending_frame->sample = sample;
+            pending_frame->mapped_buffer = mapped_buffer;
+            pending_frame->mapped_buffer_info = mapped_buffer_info;
+            pending_frame->buffer_mapped = buffer_mapped;
             pending_frame->surface = surface;
             pending_frame->mapped_egl = mapped_egl;
             pending_frame->resource = resource;
             pending_frames_.push_back(pending_frame);
             sample = nullptr;
+            mapped_buffer = nullptr;
+            buffer_mapped = false;
             surface = nullptr;
             mapped_egl = false;
             resource = nullptr;
@@ -1280,6 +1311,9 @@ private:
             }
             if (mapped_egl && surface != nullptr) {
                 NvBufSurfaceUnMapEglImage(surface, 0);
+            }
+            if (buffer_mapped && mapped_buffer != nullptr) {
+                gst_buffer_unmap(mapped_buffer, &mapped_buffer_info);
             }
             if (sample != nullptr) {
                 gst_sample_unref(sample);
