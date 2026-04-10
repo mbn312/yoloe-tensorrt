@@ -7,6 +7,7 @@
 - Unified `predict(...)` and `track(...)` around a single broad input surface with specialized internal routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
 - Added `PreparedTensorInput`, a prepared CUDA-tensor fast path, and a `benchmark` CLI for comparing host-image and CUDA-tensor inference through the native TensorRT runtime.
 - Added reproducible Jetson benchmark output with JSON result files, CPU utilization metrics, camera-path timing, and optional baseline comparison.
+- Documented the runtime benchmark matrix and added text-prompt update timing to the benchmark CLI.
 - Extended tracker sessions to use the unified input router, support prepared tensor updates, and preserve the artifact default `max_det` behavior.
 - Fixed prepared-tensor correctness issues around integer dtype validation, CUDA producer-stream handoff, and cross-stream prepared-tensor inference.
 - Fixed unit-range float preprocessing so non-square padded inputs keep the correct scale instead of being divided by `255` a second time.

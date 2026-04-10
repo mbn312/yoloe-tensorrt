@@ -191,6 +191,9 @@ yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
   --label bus --mode camera --camera-source /dev/video0 --camera-zero-copy auto
 ```
 
+See [Benchmarks](docs/benchmarks.md) for the full runtime matrix covering CPU-memory input, CUDA-tensor input, Jetson
+zero-copy camera input, text-prompt update cost, and visual-prompt update cost.
+
 ## CI/CD
 
 GitHub Actions is the supported automation path for this repository.

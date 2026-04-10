@@ -26,11 +26,16 @@ from .logging_utils import configure_logging
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark YOLOE TensorRT runtime paths, camera ingest, visual-prompt updates, and JSON regression output."
+            "Benchmark YOLOE TensorRT runtime paths, camera ingest, prompt updates, and JSON regression output."
         )
     )
     parser.add_argument("artifact_dir", help="Artifact bundle directory to benchmark.")
-    parser.add_argument("image", help="Image path to use for repeated benchmark runs.")
+    parser.add_argument(
+        "image",
+        help=(
+            "Image path for inference and visual-prompt benchmarks; accepted but not decoded for text-only benchmarks."
+        ),
+    )
     parser.add_argument(
         "--label",
         action="append",
@@ -43,9 +48,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations per mode. Defaults to 5.")
     parser.add_argument(
         "--mode",
-        choices=("host", "cuda", "camera", "both", "all"),
+        choices=("none", "host", "cuda", "camera", "both", "all"),
         default="both",
-        help="Benchmark the host-image path, CUDA fast path, camera path, host+CUDA, or all paths.",
+        help="Benchmark no inference path, host-image path, CUDA fast path, camera path, host+CUDA, or all paths.",
     )
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold.")
     parser.add_argument("--device", default="cuda:0", help="Torch/TensorRT device. Defaults to cuda:0.")
@@ -116,6 +121,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("auto", "required", "off"),
         default="auto",
         help="Camera zero-copy policy for Jetson sources.",
+    )
+    parser.add_argument(
+        "--text-prompts",
+        action="store_true",
+        help="Also benchmark set_classes() text-prompt updates.",
     )
     parser.add_argument(
         "--visual-prompts",
@@ -412,6 +422,8 @@ def _benchmark_runner(
 
 
 def _selected_modes(mode: str) -> list[str]:
+    if mode == "none":
+        return []
     if mode == "both":
         return ["host", "cuda"]
     if mode == "all":
@@ -468,6 +480,9 @@ def _benchmark_metadata(args: argparse.Namespace, created_at: str) -> dict[str, 
             "track": bool(args.track),
             "conf": float(args.conf),
             "device": str(args.device),
+            "text_prompts": bool(args.text_prompts),
+            "visual_prompts": str(args.visual_prompts),
+            "visual_runtime": str(args.visual_runtime),
             "camera": {
                 "source": args.camera_source,
                 "width": args.camera_width,
@@ -776,7 +791,7 @@ def _suppress_info_logs_for_timing():
 def _synchronize_engine_device(engine: object) -> None:
     import torch
 
-    device = torch.device(getattr(engine, "device", "cuda:0"))
+    device = torch.device(getattr(engine, "device", "cpu"))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -791,6 +806,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--runs must be greater than 0")
     if warmup < 0:
         parser.error("--warmup must be greater than or equal to 0")
+    if not selected_modes and not args.text_prompts and args.visual_prompts == "none":
+        parser.error("--mode none requires --text-prompts or --visual-prompts")
     if "camera" in selected_modes and not args.camera_source:
         parser.error("--camera-source is required when --mode is 'camera' or 'all'")
     if args.compare_to is not None and not Path(args.compare_to).is_file():
@@ -816,7 +833,9 @@ def main(argv: list[str] | None = None) -> int:
     artifact_dir = Path(args.artifact_dir)
     engine = _build_engine(artifact_dir, args.device)
     engine.clear_prompts()
-    engine.set_classes(labels)
+    if selected_modes or args.text_prompts:
+        engine.set_classes(labels)
+        _synchronize_engine_device(engine)
 
     item = None
 
@@ -825,6 +844,28 @@ def main(argv: list[str] | None = None) -> int:
         if item is None:
             item = normalize_source(Path(args.image), default_prefix="benchmark")[0]
         return item
+
+    if args.text_prompts:
+
+        def _run_text_prompt():
+            with _suppress_info_logs_for_timing():
+                engine.set_classes(labels)
+                _synchronize_engine_device(engine)
+            return None
+
+        def _setup_text_prompt():
+            with _suppress_info_logs_for_timing():
+                engine.clear_prompts()
+
+        document["results"]["text-set-classes"] = _benchmark_runner(
+            "text-set-classes",
+            _run_text_prompt,
+            runs=runs,
+            warmup=warmup,
+            profile_allocations=bool(args.profile_allocations),
+            allocation_top=int(args.allocation_top),
+            setup=_setup_text_prompt,
+        )
 
     host_tracker = engine.create_tracker() if args.track and "host" in selected_modes else None
 
@@ -923,8 +964,6 @@ def main(argv: list[str] | None = None) -> int:
                 _close_if_available(camera_source)
 
     if args.visual_prompts != "none":
-        item = _benchmark_item()
-        visual_prompt_inputs = _build_visual_prompt_inputs(item.image, labels[0])
         visual_modes = ["bbox", "mask"] if args.visual_prompts == "both" else [str(args.visual_prompts)]
         visual_runtime_labels: list[tuple[str, object]] = []
         if args.visual_runtime in {"native", "both"}:
@@ -939,30 +978,36 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("visual-python: skipped (Python visual runtime unavailable)")
 
-        for runtime_name, visual_engine in visual_runtime_labels:
-            for visual_mode in visual_modes:
-                prompt_kwargs = visual_prompt_inputs[visual_mode]
+        if visual_runtime_labels:
+            item = _benchmark_item()
+            visual_prompt_inputs = _build_visual_prompt_inputs(item.image, labels[0])
+            for runtime_name, visual_engine in visual_runtime_labels:
+                for visual_mode in visual_modes:
+                    prompt_kwargs = visual_prompt_inputs[visual_mode]
 
-                def _run_visual_prompt():
-                    with _suppress_info_logs_for_timing():
-                        visual_engine.set_visual_prompts(item.image, imgsz=target_size, **prompt_kwargs)
-                        _synchronize_engine_device(visual_engine)
-                    return None
+                    def _run_visual_prompt():
+                        with _suppress_info_logs_for_timing():
+                            visual_engine.set_visual_prompts(item.image, imgsz=target_size, **prompt_kwargs)
+                            _synchronize_engine_device(visual_engine)
+                        return None
 
-                def _setup_visual_prompt():
-                    with _suppress_info_logs_for_timing():
-                        visual_engine.clear_prompts()
+                    def _setup_visual_prompt():
+                        with _suppress_info_logs_for_timing():
+                            visual_engine.clear_prompts()
 
-                name = f"visual-{runtime_name}-{visual_mode}"
-                document["results"][name] = _benchmark_runner(
-                    name,
-                    _run_visual_prompt,
-                    runs=runs,
-                    warmup=warmup,
-                    profile_allocations=False,
-                    allocation_top=0,
-                    setup=_setup_visual_prompt,
-                )
+                    name = f"visual-{runtime_name}-{visual_mode}"
+                    document["results"][name] = _benchmark_runner(
+                        name,
+                        _run_visual_prompt,
+                        runs=runs,
+                        warmup=warmup,
+                        profile_allocations=False,
+                        allocation_top=0,
+                        setup=_setup_visual_prompt,
+                    )
+
+    if not document["results"]:
+        parser.error("no benchmark results were produced; check --mode and prompt benchmark runtime availability")
 
     if args.compare_to is not None:
         assert baseline is not None

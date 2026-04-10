@@ -76,6 +76,7 @@ def test_benchmark_cli_displays_help() -> None:
     assert result.returncode == 0
     assert "Benchmark YOLOE TensorRT runtime paths" in result.stdout
     assert "--mode" in result.stdout
+    assert "--text-prompts" in result.stdout
     assert "--visual-prompts" in result.stdout
     assert "--profile-allocations" in result.stdout
     assert "--track" in result.stdout
@@ -84,6 +85,7 @@ def test_benchmark_cli_displays_help() -> None:
     assert "--output-dir" in result.stdout
     assert "--compare-to" in result.stdout
     assert "invalid comparison" in result.stdout
+    assert "not decoded for text-only benchmarks" in result.stdout
 
 
 def test_benchmark_runner_profiles_allocations(capsys) -> None:
@@ -276,6 +278,213 @@ def test_benchmark_main_writes_json_output(monkeypatch: pytest.MonkeyPatch, tmp_
     assert payload["config"]["mode"] == "both"
     assert set(payload["results"]) == {"host", "cuda"}
     assert payload["results"]["host"]["latency_ms"]["count"] == 1
+
+
+def test_benchmark_none_mode_requires_prompt_benchmark(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        benchmark_cli.main(
+            [
+                str(tmp_path / "artifact"),
+                str(tmp_path / "image.jpg"),
+                "--mode",
+                "none",
+                "--runs",
+                "1",
+                "--warmup",
+                "0",
+                "--no-save",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_benchmark_text_prompts_writes_prompt_only_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _Engine:
+        native_visual_runtime = None
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def clear_prompts(self) -> None:
+            self.calls.append(("clear_prompts", ()))
+
+        def set_classes(self, labels: list[str]) -> None:
+            self.calls.append(("set_classes", tuple(labels)))
+
+    engine = _Engine()
+    sync_calls = {"count": 0}
+
+    monkeypatch.setattr(benchmark_cli, "_build_engine", lambda *_args, **_kwargs: engine)
+    monkeypatch.setattr(
+        benchmark_cli,
+        "_synchronize_engine_device",
+        lambda _engine: sync_calls.__setitem__("count", sync_calls["count"] + 1),
+    )
+    monkeypatch.setattr(
+        "yoloe_tensorrt.source.normalize_source",
+        lambda *_args, **_kwargs: pytest.fail("text-only benchmark should not decode the image argument"),
+    )
+
+    result = benchmark_cli.main(
+        [
+            str(tmp_path / "artifact"),
+            str(tmp_path / "image.jpg"),
+            "--label",
+            "bus",
+            "--label",
+            "person",
+            "--mode",
+            "none",
+            "--text-prompts",
+            "--runs",
+            "1",
+            "--warmup",
+            "1",
+            "--output-dir",
+            str(tmp_path / "benchmarks"),
+            "--output-name",
+            "text-result",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+
+    payload = json.loads((tmp_path / "benchmarks" / "text-result.json").read_text())
+    assert result == 0
+    assert set(payload["results"]) == {"text-set-classes"}
+    assert payload["config"]["text_prompts"] is True
+    assert payload["config"]["mode"] == "none"
+    assert payload["results"]["text-set-classes"]["latency_ms"]["count"] == 1
+    assert engine.calls == [
+        ("clear_prompts", ()),
+        ("set_classes", ("bus", "person")),
+        ("clear_prompts", ()),
+        ("set_classes", ("bus", "person")),
+        ("clear_prompts", ()),
+        ("set_classes", ("bus", "person")),
+    ]
+    assert sync_calls["count"] == 3
+
+
+def test_benchmark_none_mode_allows_visual_prompt_only_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _Engine:
+        native_visual_runtime = object()
+        visual_runtime = None
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.visual_calls = 0
+            self.text_calls = 0
+
+        def clear_prompts(self) -> None:
+            pass
+
+        def set_classes(self, _labels: list[str]) -> None:
+            self.text_calls += 1
+
+        def set_visual_prompts(self, *_args, **_kwargs) -> None:
+            self.visual_calls += 1
+
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    engine = _Engine()
+
+    monkeypatch.setattr(benchmark_cli, "_build_engine", lambda *_args, **_kwargs: engine)
+    monkeypatch.setattr(benchmark_cli, "_synchronize_engine_device", lambda _engine: None)
+    monkeypatch.setattr(
+        "yoloe_tensorrt.source.normalize_source",
+        lambda *_args, **_kwargs: [SourceItem(image=image, path="benchmark0")],
+    )
+
+    result = benchmark_cli.main(
+        [
+            str(tmp_path / "artifact"),
+            str(tmp_path / "image.jpg"),
+            "--mode",
+            "none",
+            "--visual-prompts",
+            "bbox",
+            "--visual-runtime",
+            "native",
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--output-dir",
+            str(tmp_path / "benchmarks"),
+            "--output-name",
+            "visual-result",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+
+    payload = json.loads((tmp_path / "benchmarks" / "visual-result.json").read_text())
+    assert result == 0
+    assert set(payload["results"]) == {"visual-native-bbox"}
+    assert payload["config"]["mode"] == "none"
+    assert payload["config"]["visual_prompts"] == "bbox"
+    assert engine.visual_calls == 1
+    assert engine.text_calls == 0
+
+
+def test_benchmark_none_mode_rejects_visual_prompt_without_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _Engine:
+        native_visual_runtime = None
+        visual_runtime = None
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.text_calls = 0
+
+        def clear_prompts(self) -> None:
+            pass
+
+        def set_classes(self, _labels: list[str]) -> None:
+            self.text_calls += 1
+
+    engine = _Engine()
+
+    monkeypatch.setattr(benchmark_cli, "_build_engine", lambda *_args, **_kwargs: engine)
+    monkeypatch.setattr(benchmark_cli, "_synchronize_engine_device", lambda _engine: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        benchmark_cli.main(
+            [
+                str(tmp_path / "artifact"),
+                str(tmp_path / "image.jpg"),
+                "--mode",
+                "none",
+                "--visual-prompts",
+                "bbox",
+                "--visual-runtime",
+                "native",
+                "--runs",
+                "1",
+                "--warmup",
+                "0",
+                "--output-dir",
+                str(tmp_path / "benchmarks"),
+                "--output-name",
+                "empty-result",
+                "--log-level",
+                "WARNING",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert not (tmp_path / "benchmarks" / "empty-result.json").exists()
+    assert engine.text_calls == 0
 
 
 def test_benchmark_all_mode_writes_host_cuda_and_camera_results(
