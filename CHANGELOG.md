@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added YOLOE dataset config validation helpers for Ultralytics-style detection and segmentation training inputs.
+
 ## 0.2.0
 
 - Unified `predict(...)` and `track(...)` around a broad input surface with specialized routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
