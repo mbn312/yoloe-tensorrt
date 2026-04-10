@@ -2,10 +2,13 @@
 
 ## Unreleased
 
+## 0.3.0
+
 - Added a `yoloe-train` CLI and `python -m yoloe_tensorrt train` entrypoint for YOLOE training and fine-tuning.
 - Added a package-level `train_model(...)` API for YOLOE training and fine-tuning through Ultralytics.
-- Added optional training-to-export integration so `train_model(...)` and `yoloe-train` can export the best or last fine-tuned checkpoint into a TensorRT artifact bundle.
+- Added optional training-to-export integration so `train_model(...)` and `yoloe-train` can export the best or last fine-tuned checkpoint into a TensorRT artifact bundle while preserving runtime prompt support and storing training traceability metadata in `metadata.json`.
 - Added YOLOE dataset config validation helpers for Ultralytics-style detection and segmentation training inputs.
+- Expanded the training and fine-tuning docs with dataset format examples, output layout, Jetson guidance, prompt-behavior notes, and an end-to-end export-to-runtime workflow.
 
 ## 0.2.0
 

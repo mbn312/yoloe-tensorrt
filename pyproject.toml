@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "yoloe-tensorrt"
-version = "0.2.0"
+version = "0.3.0"
 description = "TensorRT runtime for Ultralytics YOLOE with runtime text and visual prompts"
 readme = "README.md"
 requires-python = ">=3.10"

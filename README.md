@@ -104,6 +104,19 @@ Export a bundle:
 yoloe-export yoloe-26s-seg.pt --artifact-dir outputs/artifacts/yoloe26s --fixed --imgsz 640
 ```
 
+Train or fine-tune a checkpoint and export the result for runtime inference:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml \
+  --task segment \
+  --device cuda:0 \
+  --export \
+  --export-artifact-dir outputs/artifacts/seg-run
+```
+
+See [Training](docs/training.md) for dataset format, output layout, Jetson guidance, and the full export-to-runtime
+workflow.
+
 On newer PyTorch builds, the default ONNX exporter mode is `auto`: it tries the newer dynamo exporter first and falls back to the legacy exporter if YOLOE tracing is incompatible. To force the stable legacy path explicitly:
 
 ```bash
@@ -201,7 +214,7 @@ zero-copy camera input, text-prompt update cost, and visual-prompt update cost.
 GitHub Actions is the supported automation path for this repository.
 
 - CI runs Ruff, runner-safe unit tests, docs validation, source-distribution builds, and clean install smoke tests.
-- Tag pushes like `v0.2.0` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
+- Tag pushes like `vX.Y.Z` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
 - GPU and Jetson-specific validation are intentionally not part of required public CI yet.
 
 ## Model Assets and Caching
@@ -251,12 +264,12 @@ GitHub Actions is the supported automation path for this repository.
 
 ## Status
 
-The project is usable today for Jetson-focused deployments, but it is still early-stage. Version 0.2.0 completes the
-main runtime performance roadmap around CUDA preprocess, native postprocess, native visual prompts, zero-copy camera
-ingest, and benchmark coverage.
+The project is usable today for Jetson-focused deployments, but it is still early-stage. Version 0.3.0 adds dataset
+validation, training and fine-tuning surfaces, and post-training TensorRT artifact export on top of the existing
+runtime, camera, GUI, and benchmark tooling.
 
-Remaining work is focused on deployment hardening, target-hardware benchmark baselines, and keeping GPU/Jetson validation
-available outside required public CI.
+Remaining work is focused on deployment hardening, target-hardware benchmark baselines, workflow polish, and keeping
+GPU/Jetson validation available outside required public CI.
 
 ## License
 
