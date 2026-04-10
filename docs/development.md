@@ -58,11 +58,32 @@ python -m pytest -s -o log_cli=true --log-cli-level=INFO \
 
 The public API is unified around `YOLOEEngine.predict(...)` and `YOLOEEngine.track(...)`, but the lowest-overhead headless
 route is still the prepared-tensor path returned by `YOLOEEngine.prepare_cuda_input(...)`. Benchmark host-image vs
-prepared-tensor inference with:
+prepared-tensor inference with JSON output under `outputs/benchmarks/`:
 
 ```bash
-yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode both --runs 200 --warmup 20
 ```
+
+Jetson camera-path benchmarks use the same command and consume a finite live-source window of `warmup + runs` frames:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode camera --camera-source /dev/video0 \
+  --camera-zero-copy auto --runs 200 --warmup 20
+```
+
+Each result reports median/p95 latency, FPS, measured-loop process CPU, and measured-loop total system CPU. To compare
+against a saved baseline without failing the command, use:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode all --camera-source /dev/video0 \
+  --compare-to outputs/benchmarks/<baseline>.json
+```
+
+Add `--fail-on-regression` to make the command exit non-zero when the configured latency, FPS, or CPU thresholds are
+exceeded, or when the comparison is invalid because no modes or no metrics were compared.
 
 ## CI and release automation
 

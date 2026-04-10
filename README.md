@@ -180,7 +180,15 @@ scripts/launch_camera_gui.sh
 Benchmark host-image vs CUDA-tensor paths:
 
 ```bash
-yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode both --runs 200 --warmup 20
+```
+
+Benchmark a Jetson camera source and save structured results under `outputs/benchmarks/`:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode camera --camera-source /dev/video0 --camera-zero-copy auto
 ```
 
 ## CI/CD
@@ -227,6 +235,7 @@ GitHub Actions is the supported automation path for this repository.
 - [Quickstart](docs/quickstart.md)
 - [Export and Artifact Bundles](docs/export.md)
 - [Runtime Prompts](docs/prompts.md)
+- [Benchmarks](docs/benchmarks.md)
 - [Camera GUI](docs/camera-gui.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Development](docs/development.md)
