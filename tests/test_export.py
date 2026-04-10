@@ -8,6 +8,7 @@ import pytest
 import torch
 import yoloe_tensorrt.export as export_mod
 from yoloe_tensorrt import export_model
+from yoloe_tensorrt.artifacts import ArtifactMetadata
 
 
 def test_export_model_creates_expected_onnx_artifacts(tmp_path: Path, model_checkpoint: Path) -> None:
@@ -84,7 +85,7 @@ def test_export_model_resumes_partial_main_only_bundle_without_reexport(
     output_dir = export_model(
         model_checkpoint,
         artifact_dir=artifact_dir,
-        formats=("engine",),
+        formats="engine",
         dynamic=False,
         build_visual_engine=False,
         overwrite=False,
@@ -97,6 +98,42 @@ def test_export_model_resumes_partial_main_only_bundle_without_reexport(
     assert metadata["main_engine_filename"] == "main.engine"
     assert metadata["visual_onnx_filename"] is None
     assert metadata["visual_engine_filename"] is None
+
+
+def test_export_model_writes_training_metadata(tmp_path: Path, model_checkpoint: Path) -> None:
+    artifact_dir = export_model(
+        model_checkpoint,
+        artifact_dir=tmp_path / "artifacts",
+        formats=("onnx",),
+        dynamic=True,
+        training_metadata={
+            "run_dir": Path("outputs/training/seg-run"),
+            "export_checkpoint": "best",
+            "device": torch.device("cpu"),
+            "checkpoints": (Path("best.pt"), Path("last.pt")),
+        },
+    )
+
+    metadata = json.loads((artifact_dir / "metadata.json").read_text())
+    assert metadata["training_metadata"] == {
+        "run_dir": "outputs/training/seg-run",
+        "export_checkpoint": "best",
+        "device": "cpu",
+        "checkpoints": ["best.pt", "last.pt"],
+    }
+
+
+def test_artifact_metadata_from_dict_defaults_missing_training_metadata(
+    tmp_path: Path,
+    model_checkpoint: Path,
+) -> None:
+    artifact_dir = export_model(model_checkpoint, artifact_dir=tmp_path / "artifacts", formats=("onnx",), dynamic=True)
+    data = json.loads((artifact_dir / "metadata.json").read_text())
+    data.pop("training_metadata", None)
+
+    metadata = ArtifactMetadata.from_dict(data)
+
+    assert metadata.training_metadata is None
 
 
 def test_export_onnx_auto_falls_back_to_legacy_when_dynamo_fails(

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import yaml
 import yoloe_tensorrt
+import yoloe_tensorrt.export as export_mod
 from yoloe_tensorrt import TrainingError, TrainingResult, train_model, training
 from yoloe_tensorrt.datasets import DatasetConfig, DatasetSplit
 
@@ -135,6 +136,10 @@ def test_train_model_validates_dataset_and_calls_ultralytics(monkeypatch: pytest
     assert result.checkpoint_path == best_path.resolve()
     assert result.run_dir == run_dir.resolve()
     assert result.metrics_path == metrics_path.resolve()
+    assert result.best_checkpoint_path == best_path.resolve()
+    assert result.last_checkpoint_path == last_path.resolve()
+    assert result.artifact_dir is None
+    assert result.exported_checkpoint_path is None
     assert result.metadata["dataset"] == {
         "root": str(tmp_path / "dataset"),
         "names": {0: "person"},
@@ -183,6 +188,158 @@ def test_train_model_merges_non_conflicting_ultralytics_overrides(
     assert fake_yoloe.instances[0].train_kwargs["workers"] == 2
     assert fake_yoloe.instances[0].train_kwargs["optimizer"] == "AdamW"
     assert fake_yoloe.instances[0].train_kwargs["lr0"] == 0.001
+
+
+def test_train_model_can_export_best_checkpoint_with_traceability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_path = _make_dataset_config(tmp_path)
+    run_dir = tmp_path / "runs" / "train"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    best_path = weights_dir / "best.pt"
+    last_path = weights_dir / "last.pt"
+    best_path.write_bytes(b"best")
+    last_path.write_bytes(b"last")
+    metrics_path = run_dir / "results.csv"
+    metrics_path.write_text("metrics\n", encoding="utf-8")
+    _install_fake_yoloe(
+        monkeypatch,
+        trainer=SimpleNamespace(save_dir=run_dir, best=best_path, last=last_path),
+    )
+
+    export_calls: list[tuple[Path, dict[str, Any]]] = []
+
+    def _fake_export(model_checkpoint: str | Path, **kwargs: Any) -> Path:
+        export_calls.append((Path(model_checkpoint), kwargs))
+        return tmp_path / "artifacts" / "bundle"
+
+    monkeypatch.setattr(export_mod, "export_model", _fake_export)
+
+    result = train_model(
+        "model.pt",
+        dataset_path,
+        export_artifact=True,
+        export_checkpoint="best",
+        export_artifact_dir=tmp_path / "exports",
+        export_formats="onnx",
+        export_dynamic=False,
+        export_build_visual_engine=False,
+        export_fp16=False,
+        export_imgsz=320,
+        export_max_det=17,
+        export_overwrite=False,
+        export_workspace_bytes=1234,
+        export_onnx_exporter="legacy",
+        export_onnx_opset_version=17,
+    )
+
+    assert result.exported_checkpoint_path == best_path.resolve()
+    assert result.artifact_dir == tmp_path / "artifacts" / "bundle"
+    assert export_calls == [
+        (
+            best_path.resolve(),
+            {
+                "artifact_dir": tmp_path / "exports",
+                "formats": "onnx",
+                "dynamic": False,
+                "build_visual_engine": False,
+                "fp16": False,
+                "imgsz": 320,
+                "max_det": 17,
+                "overwrite": False,
+                "workspace_bytes": 1234,
+                "onnx_exporter": "legacy",
+                "onnx_opset_version": 17,
+                "training_metadata": {
+                    **result.metadata,
+                    "run_dir": str(run_dir.resolve()),
+                    "metrics_path": str(metrics_path.resolve()),
+                    "checkpoint_path": str(best_path.resolve()),
+                    "best_checkpoint_path": str(best_path.resolve()),
+                    "last_checkpoint_path": str(last_path.resolve()),
+                    "export_checkpoint": "best",
+                    "exported_checkpoint_path": str(best_path.resolve()),
+                },
+            },
+        )
+    ]
+
+
+def test_train_model_can_export_last_checkpoint_even_when_best_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_path = _make_dataset_config(tmp_path)
+    run_dir = tmp_path / "runs" / "train"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    best_path = weights_dir / "best.pt"
+    last_path = weights_dir / "last.pt"
+    best_path.write_bytes(b"best")
+    last_path.write_bytes(b"last")
+    _install_fake_yoloe(
+        monkeypatch,
+        trainer=SimpleNamespace(save_dir=run_dir, best=best_path, last=last_path),
+    )
+
+    exported: list[Path] = []
+    monkeypatch.setattr(
+        export_mod,
+        "export_model",
+        lambda model_checkpoint, **_kwargs: exported.append(Path(model_checkpoint)) or (tmp_path / "artifacts"),
+    )
+
+    result = train_model("model.pt", dataset_path, export_artifact=True, export_checkpoint="last")
+
+    assert exported == [last_path.resolve()]
+    assert result.exported_checkpoint_path == last_path.resolve()
+
+
+def test_train_model_raises_when_requested_export_checkpoint_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_path = _make_dataset_config(tmp_path)
+    run_dir = tmp_path / "runs" / "train"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    last_path = weights_dir / "last.pt"
+    last_path.write_bytes(b"last")
+    _install_fake_yoloe(
+        monkeypatch,
+        trainer=SimpleNamespace(save_dir=run_dir, best=None, last=last_path),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "export_model",
+        lambda *_args, **_kwargs: pytest.fail("export_model should not be called when the named checkpoint is missing"),
+    )
+
+    with pytest.raises(TrainingError, match="Could not export the best checkpoint"):
+        train_model("model.pt", dataset_path, export_artifact=True, export_checkpoint="best")
+
+
+def test_train_model_wraps_export_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    dataset_path = _make_dataset_config(tmp_path)
+    run_dir = tmp_path / "runs" / "train"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    best_path = weights_dir / "best.pt"
+    best_path.write_bytes(b"best")
+    _install_fake_yoloe(
+        monkeypatch,
+        trainer=SimpleNamespace(save_dir=run_dir, best=best_path, last=None),
+    )
+
+    def _fail_export(*_args: Any, **_kwargs: Any) -> Path:
+        raise RuntimeError("export boom")
+
+    monkeypatch.setattr(export_mod, "export_model", _fail_export)
+
+    with pytest.raises(TrainingError, match="Training succeeded but export failed"):
+        train_model("model.pt", dataset_path, export_artifact=True)
 
 
 @pytest.mark.parametrize("save_value", [False, 0])

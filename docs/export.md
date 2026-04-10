@@ -38,6 +38,9 @@ If visual prompt export is enabled, it may also contain:
 - `visual_prompt.onnx`
 - `visual_prompt.engine`
 
+`metadata.json` always stores the core runtime/export metadata. When the bundle was produced from the training flow, it
+can also include a `training_metadata` block for traceability back to the training run and selected checkpoint.
+
 ## Production guidance
 
 - Prefer prebuilt bundles and `YOLOEEngine.from_engine(...)`.

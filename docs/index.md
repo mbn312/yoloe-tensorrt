@@ -10,7 +10,7 @@ the main inference hot path into a native backend.
 - Production use through prebuilt artifact bundles
 - Live USB, RTSP, and Jetson zero-copy camera experimentation through a bundled GUI
 - Runtime benchmark checks across input paths and prompt update costs
-- Dataset config validation before YOLOE training and fine-tuning workflows
+- Dataset config validation before YOLOE training and fine-tuning workflows, with optional post-training artifact export
 
 ## What it is not
 

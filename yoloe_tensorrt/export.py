@@ -4,7 +4,7 @@ import gc
 import inspect
 import shutil
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal, Mapping
 
 import torch
 import torch.nn as nn
@@ -183,6 +183,17 @@ def _make_visual_profile(
     )
 
 
+def _normalize_formats(formats: Iterable[str] | str) -> tuple[str, ...]:
+    entries = (formats,) if isinstance(formats, str) else tuple(formats)
+    normalized = tuple(str(entry).lower() for entry in entries)
+    if not normalized:
+        raise ValueError("At least one export format must be requested.")
+    invalid = sorted({entry for entry in normalized if entry not in {"onnx", "engine"}})
+    if invalid:
+        raise ValueError(f"Unsupported export format(s): {', '.join(invalid)}")
+    return normalized
+
+
 def _torch_onnx_export_signature() -> inspect.Signature | None:
     try:
         return inspect.signature(torch.onnx.export)
@@ -358,7 +369,7 @@ def _export_onnx(
 def export_model(
     pt_path: str | Path,
     artifact_dir: str | Path | None = None,
-    formats: Iterable[str] = ("onnx", "engine"),
+    formats: Iterable[str] | str = ("onnx", "engine"),
     dynamic: bool = True,
     build_visual_engine: bool = True,
     fp16: bool = True,
@@ -368,11 +379,12 @@ def export_model(
     workspace_bytes: int = 2 << 30,
     onnx_exporter: OnnxExporterMode = "auto",
     onnx_opset_version: int | None = None,
+    training_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     model_path = _resolved_model_path(pt_path)
     artifact_root = Path(artifact_dir) if artifact_dir is not None else default_artifact_dir(model_path)
     artifact_root.mkdir(parents=True, exist_ok=True)
-    requested_formats = {fmt.lower() for fmt in formats}
+    requested_formats = set(_normalize_formats(formats))
     main_onnx_path = artifact_root / MAIN_ONNX_FILENAME
     main_engine_path = artifact_root / MAIN_ENGINE_FILENAME
     visual_onnx_path = artifact_root / VISUAL_ONNX_FILENAME
@@ -577,6 +589,7 @@ def export_model(
         image_profile=image_profile,
         prompt_profile=prompt_profile,
         visual_profile=visual_profile if build_visual_engine else None,
+        training_metadata=None if training_metadata is None else dict(training_metadata),
     )
     save_metadata(artifact_root, metadata)
     LOGGER.info("Saved artifact metadata to '%s'", artifact_root / "metadata.json")

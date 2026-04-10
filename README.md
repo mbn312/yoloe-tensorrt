@@ -1,6 +1,6 @@
 # yoloe-tensorrt
 
-`yoloe-tensorrt` is a Jetson-first TensorRT runtime for Ultralytics YOLOE models with runtime-custom text labels and visual prompts. It exposes a normal Python package API, ships a native C++ TensorRT backend for the main inference hot path, and includes a live camera GUI for interactive testing.
+`yoloe-tensorrt` is a Jetson-first TensorRT runtime for Ultralytics YOLOE models with runtime-custom text labels and visual prompts. It exposes a normal Python package API, ships a native C++ TensorRT backend for the main inference hot path, includes a live camera GUI for interactive testing, and can export fine-tuned checkpoints directly into TensorRT artifact bundles.
 
 ## Highlights
 
@@ -11,7 +11,7 @@
 - Unified `predict(...)` and `track(...)` APIs with a prepared-tensor fast path
 - RTSP, USB camera, and Jetson zero-copy NVMM/EGL/CUDA camera ingest support
 - Structured benchmark CLI for runtime paths, prompt updates, CPU use, allocations, and regression comparison
-- Python package API, export CLI, and live camera GUI
+- Python package API, export CLI, training CLI, and live camera GUI
 - Jetson-first deployment model with Linux x86_64 CUDA/TensorRT also supported
 
 ## Supported Environments
@@ -242,6 +242,7 @@ GitHub Actions is the supported automation path for this repository.
 - [Installation](docs/installation.md)
 - [Quickstart](docs/quickstart.md)
 - [Export and Artifact Bundles](docs/export.md)
+- [Training](docs/training.md)
 - [Runtime Prompts](docs/prompts.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Camera GUI](docs/camera-gui.md)

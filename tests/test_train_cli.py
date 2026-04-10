@@ -30,6 +30,9 @@ def test_train_cli_displays_help() -> None:
     assert "--resume" in result.stdout
     assert "--resume-checkpoint" in result.stdout
     assert "--ultralytics-arg" in result.stdout
+    assert "--export" in result.stdout
+    assert "--export-checkpoint" in result.stdout
+    assert "--export-format" in result.stdout
 
 
 def test_train_cli_passes_core_args_and_prints_result(
@@ -179,6 +182,105 @@ def test_train_cli_omits_metrics_when_unavailable(
     assert output == f"checkpoint: {tmp_path / 'best.pt'}\nrun_dir: {tmp_path / 'run'}\n"
 
 
+def test_train_cli_forwards_post_training_export_options_and_prints_artifact_info(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, Any]] = []
+    checkpoint = tmp_path / "runs" / "seg" / "weights" / "best.pt"
+    run_dir = checkpoint.parent.parent
+    artifact_dir = tmp_path / "artifacts" / "bundle"
+
+    def _fake_train_model(model_checkpoint: str, dataset_config: Path, **kwargs: Any) -> TrainingResult:
+        calls.append(
+            {
+                "model_checkpoint": model_checkpoint,
+                "dataset_config": dataset_config,
+                **kwargs,
+            }
+        )
+        return TrainingResult(
+            checkpoint_path=checkpoint,
+            run_dir=run_dir,
+            metrics_path=None,
+            metadata={},
+            best_checkpoint_path=checkpoint,
+            artifact_dir=artifact_dir,
+            exported_checkpoint_path=checkpoint,
+        )
+
+    monkeypatch.setattr(train_cli, "train_model", _fake_train_model)
+
+    exit_code = train_cli.main(
+        [
+            "model.pt",
+            "data.yaml",
+            "--export",
+            "--export-checkpoint",
+            "last",
+            "--export-artifact-dir",
+            str(tmp_path / "exports"),
+            "--export-format",
+            "onnx",
+            "--export-format",
+            "engine",
+            "--export-fixed",
+            "--export-no-visual-engine",
+            "--export-no-fp16",
+            "--export-imgsz",
+            "320",
+            "--export-max-det",
+            "17",
+            "--export-workspace-mb",
+            "64",
+            "--export-exporter",
+            "legacy",
+            "--export-opset-version",
+            "17",
+            "--export-overwrite",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert output == (
+        f"checkpoint: {checkpoint}\n"
+        f"run_dir: {run_dir}\n"
+        f"exported_checkpoint: {checkpoint}\n"
+        f"artifact_dir: {artifact_dir}\n"
+    )
+    assert calls == [
+        {
+            "model_checkpoint": "model.pt",
+            "dataset_config": Path("data.yaml"),
+            "task": "detect",
+            "imgsz": 640,
+            "epochs": 100,
+            "batch": 16,
+            "device": None,
+            "output_dir": Path("outputs/training"),
+            "name": None,
+            "overrides": {},
+            "validate_dataset": True,
+            "exist_ok": False,
+            "export_artifact": True,
+            "export_checkpoint": "last",
+            "export_artifact_dir": tmp_path / "exports",
+            "export_formats": ("onnx", "engine"),
+            "export_dynamic": False,
+            "export_build_visual_engine": False,
+            "export_fp16": False,
+            "export_imgsz": 320,
+            "export_max_det": 17,
+            "export_overwrite": True,
+            "export_workspace_bytes": 64 << 20,
+            "export_onnx_exporter": "legacy",
+            "export_onnx_opset_version": 17,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -190,6 +292,7 @@ def test_train_cli_omits_metrics_when_unavailable(
         ["model.pt", "data.yaml", "--ultralytics-arg", "workers=["],
         ["model.pt", "data.yaml", "--imgsz", "320x"],
         ["model.pt", "data.yaml", "--imgsz", "320", "480", "640"],
+        ["model.pt", "data.yaml", "--export-format", "engine"],
     ],
 )
 def test_train_cli_rejects_invalid_cli_args(
