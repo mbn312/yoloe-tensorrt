@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a `yoloe-train` CLI and `python -m yoloe_tensorrt train` entrypoint for YOLOE training and fine-tuning.
 - Added a package-level `train_model(...)` API for YOLOE training and fine-tuning through Ultralytics.
 - Added YOLOE dataset config validation helpers for Ultralytics-style detection and segmentation training inputs.
 

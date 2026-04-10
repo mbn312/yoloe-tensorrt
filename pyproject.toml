@@ -76,6 +76,7 @@ all = [
 yoloe-camera-gui = "yoloe_tensorrt.gui:main"
 yoloe-export = "yoloe_tensorrt.export_cli:main"
 yoloe-benchmark = "yoloe_tensorrt.benchmark_cli:main"
+yoloe-train = "yoloe_tensorrt.train_cli:main"
 
 [tool.scikit-build]
 cmake.build-type = "Release"

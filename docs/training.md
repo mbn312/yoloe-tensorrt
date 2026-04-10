@@ -5,6 +5,53 @@ validates dataset configs before launching a run.
 
 ## Train or fine-tune
 
+Use `yoloe-train` for command-line training:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml \
+  --task segment \
+  --imgsz 640 \
+  --epochs 50 \
+  --batch 8 \
+  --device cuda:0 \
+  --output-dir outputs/training \
+  --name seg-run
+```
+
+The same command is available through the module entry point:
+
+```bash
+python -m yoloe_tensorrt train yoloe-26s-seg.pt data.yaml --task segment
+```
+
+On success, the CLI prints the trained checkpoint and run directory. It also prints the metrics file when Ultralytics
+created one:
+
+```text
+checkpoint: outputs/training/seg-run/weights/best.pt
+run_dir: outputs/training/seg-run
+metrics: outputs/training/seg-run/results.csv
+```
+
+Resume an interrupted run with `--resume`, or pass a specific checkpoint:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml --resume
+yoloe-train yoloe-26s-seg.pt data.yaml --resume-checkpoint outputs/training/seg-run/weights/last.pt
+```
+
+Pass advanced Ultralytics trainer options with repeatable `--ultralytics-arg KEY=VALUE` entries. Values are parsed as
+YAML:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml \
+  --ultralytics-arg workers=4 \
+  --ultralytics-arg optimizer=AdamW \
+  --ultralytics-arg lr0=0.001
+```
+
+By default, CLI run outputs are placed under `outputs/training`.
+
 Use `train_model(...)` when you want the package to validate the dataset and call Ultralytics for you:
 
 ```python
