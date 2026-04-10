@@ -89,5 +89,9 @@ All from the same window while the stream is running.
 ## Benchmark current paths
 
 ```bash
-yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg --label bus --mode both
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode both --runs 200 --warmup 20
 ```
+
+See [Benchmarks](benchmarks.md) for the full v0.2.0 benchmark matrix covering CPU-memory input, CUDA-tensor input,
+Jetson zero-copy camera input, text-prompt updates, and visual-prompt updates.

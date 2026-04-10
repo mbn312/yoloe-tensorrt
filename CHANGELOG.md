@@ -1,20 +1,22 @@
 # Changelog
 
-## 0.2.0
-
 ## Unreleased
 
-- Unified `predict(...)` and `track(...)` around a single broad input surface with specialized internal routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
-- Added `PreparedTensorInput`, a prepared CUDA-tensor fast path, and a `benchmark` CLI for comparing host-image and CUDA-tensor inference through the native TensorRT runtime.
-- Added reproducible Jetson benchmark output with JSON result files, CPU utilization metrics, camera-path timing, and optional baseline comparison.
-- Documented the runtime benchmark matrix and added text-prompt update timing to the benchmark CLI.
-- Extended tracker sessions to use the unified input router, support prepared tensor updates, and preserve the artifact default `max_det` behavior.
-- Fixed prepared-tensor correctness issues around integer dtype validation, CUDA producer-stream handoff, and cross-stream prepared-tensor inference.
-- Fixed unit-range float preprocessing so non-square padded inputs keep the correct scale instead of being divided by `255` a second time.
-- Expanded runtime and unit coverage for unified routing, benchmark CLI help, tracker-session input handling, and prepared-tensor regressions.
-- Added first-class RTSP input support so plain `rtsp://...` and `rtsps://...` sources can be used without writing a custom GStreamer pipeline.
-- Added an optional Jetson zero-copy camera ingest path that maps NVMM frames through EGL/CUDA, emits prepared tensors for inference, and falls back to the CPU appsink path when zero-copy is unavailable.
-- Updated GUI
+## 0.2.0
+
+- Unified `predict(...)` and `track(...)` around a broad input surface with specialized routing for paths, arrays, raw tensors, prepared CUDA tensors, and live sources.
+- Added `PreparedTensorInput`, prepared CUDA-tensor prediction/tracking paths, and tracker-session support for prepared tensor updates.
+- Added first-class RTSP input support for plain `rtsp://...` and `rtsps://...` sources without requiring custom GStreamer pipelines.
+- Added Jetson zero-copy camera ingest using NVMM/EGL/CUDA interop, prepared tensor frame handoff, and CPU appsink fallback when zero-copy is unavailable.
+- Replaced native CPU/OpenCV preprocessing with shared CUDA preprocess kernels for resize, letterbox, color conversion, normalization, and tensor packing.
+- Moved main-runtime decode, NMS, box rescale, and segmentation mask reconstruction into the native backend.
+- Moved visual-prompt TensorRT execution into the native backend and syncs prompt embeddings on device to avoid GPU-to-CPU-to-GPU round trips.
+- Reduced steady-state Python allocations in prediction and tracking hot paths through cached prompt names, cached native metadata, and leaner result construction.
+- Added the `yoloe-benchmark` CLI with host, CUDA, camera, text-prompt, visual-prompt, tracking, allocation, JSON output, and baseline-regression comparison modes.
+- Documented the full runtime benchmark matrix for CPU-memory input, CUDA-tensor input, Jetson zero-copy camera input, text-prompt update cost, and visual-prompt update cost.
+- Improved the live camera GUI with source controls, editable labels, confidence controls, tracking controls, RTSP/videotest source handling, and Jetson zero-copy capture when available.
+- Fixed prepared-tensor correctness issues around integer dtype validation, CUDA producer-stream handoff, unit-range float inputs, cross-stream inference, and artifact `max_det` defaults.
+- Expanded unit and integration coverage for input routing, native fast paths, zero-copy camera ingest, RTSP routing, benchmark CLI behavior, tracking, GUI helpers, and release metadata.
 
 ## 0.1.3
 

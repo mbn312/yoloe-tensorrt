@@ -5,10 +5,12 @@
 ## Highlights
 
 - Runtime text labels without rebuilding the main TensorRT engine
-- Optional visual prompts for YOLOE detection and segmentation models
+- Native visual-prompt TensorRT execution for YOLOE detection and segmentation models
 - Stateful object tracking with ByteTrack or BoT-SORT on top of YOLOE results
-- Native C++ TensorRT main-engine runtime with GPU output handoff back to Python
+- Native C++ TensorRT main-engine runtime with CUDA preprocess, native postprocess, and GPU output handoff back to Python
 - Unified `predict(...)` and `track(...)` APIs with a prepared-tensor fast path
+- RTSP, USB camera, and Jetson zero-copy NVMM/EGL/CUDA camera ingest support
+- Structured benchmark CLI for runtime paths, prompt updates, CPU use, allocations, and regression comparison
 - Python package API, export CLI, and live camera GUI
 - Jetson-first deployment model with Linux x86_64 CUDA/TensorRT also supported
 
@@ -199,7 +201,7 @@ zero-copy camera input, text-prompt update cost, and visual-prompt update cost.
 GitHub Actions is the supported automation path for this repository.
 
 - CI runs Ruff, runner-safe unit tests, docs validation, source-distribution builds, and clean install smoke tests.
-- Tag pushes like `v0.1.0` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
+- Tag pushes like `v0.2.0` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
 - GPU and Jetson-specific validation are intentionally not part of required public CI yet.
 
 ## Model Assets and Caching
@@ -213,7 +215,10 @@ GitHub Actions is the supported automation path for this repository.
 ## Runtime Notes
 
 - The main inference engine path is native C++/TensorRT.
-- Prompt compilation, visual prompt orchestration, and Ultralytics `Results` wrapping still live in Python.
+- Host-image preprocessing uses native CUDA kernels when the native runtime is built.
+- Main-engine decode, NMS, box rescale, and segmentation mask reconstruction run in the native backend.
+- Visual-prompt TensorRT execution can run through the native backend, with Python still orchestrating prompt setup.
+- Prompt compilation and Ultralytics `Results` wrapping still live in Python.
 - Tracking is stateful and currently runs in Python on top of the detection/segmentation results.
 - `predict(...)` and `track(...)` choose the fastest supported internal path for the input representation they are given.
 - The prepared-tensor fast path is reached by passing the object returned from `prepare_cuda_input(...)` or by using `input_hint="prepared"`.
@@ -245,11 +250,12 @@ GitHub Actions is the supported automation path for this repository.
 
 ## Status
 
-The project is usable today for Jetson-focused deployments, but it is still early-stage. The remaining performance roadmap is centered on:
+The project is usable today for Jetson-focused deployments, but it is still early-stage. Version 0.2.0 completes the
+main runtime performance roadmap around CUDA preprocess, native postprocess, native visual prompts, zero-copy camera
+ingest, and benchmark coverage.
 
-- CUDA preprocess instead of CPU/OpenCV preprocess
-- Native decode/NMS/mask reconstruction
-- Native visual-prompt execution
+Remaining work is focused on deployment hardening, target-hardware benchmark baselines, and keeping GPU/Jetson validation
+available outside required public CI.
 
 ## License
 

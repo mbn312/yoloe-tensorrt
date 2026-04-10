@@ -92,7 +92,7 @@ The full benchmark matrix, including text-prompt and visual-prompt update costs,
 
 - Public CI runs Ruff, runner-safe unit tests, docs validation, sdist builds, and clean install smoke tests.
 - Required public CI does not assume CUDA, TensorRT headers, or a self-hosted Jetson runner.
-- Tag pushes like `v0.1.0` trigger the release scaffold, which verifies the version and changelog before uploading source artifacts.
+- Tag pushes like `v0.2.0` trigger the release scaffold, which verifies the version and changelog before uploading source artifacts.
 - GPU and Jetson-specific validation remain a future optional self-hosted workflow.
 
 ## Output conventions
