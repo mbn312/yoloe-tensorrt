@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -117,7 +116,8 @@ def _python_reference_from_native_image_outputs(
     }
     return runtime_engine._postprocess_predictions(
         outputs=outputs,
-        sample=SimpleNamespace(original=item.image, path=item.path),
+        original_image=item.image,
+        path=item.path,
         input_shape=tuple(int(v) for v in native_outputs["input_shape"]),
         names=labels,
         conf=conf,
@@ -152,7 +152,11 @@ def _python_reference_from_native_tensor_outputs(
         producer_stream,
     )
     outputs = {name: from_dlpack(native_outputs[name]) for name in runtime_engine._main_output_names}
-    sample = runtime_engine._resolve_original_sample(prepared.original_image, prepared.path, input_shape)
+    original_image, path = runtime_engine._resolve_original_image_path(
+        prepared.original_image,
+        prepared.path,
+        input_shape,
+    )
     speed = {
         "preprocess": float(native_outputs["preprocess_ms"]),
         "inference": float(native_outputs["inference_ms"]),
@@ -160,7 +164,8 @@ def _python_reference_from_native_tensor_outputs(
     }
     return runtime_engine._postprocess_predictions(
         outputs=outputs,
-        sample=sample,
+        original_image=original_image,
+        path=path,
         input_shape=tuple(int(v) for v in native_outputs["input_shape"]),
         names=labels,
         conf=conf,

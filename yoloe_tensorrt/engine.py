@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Callable, Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 import torch
@@ -71,7 +70,18 @@ class YOLOEEngine:
         self._visual_prompt_embeddings: torch.Tensor | None = None
         self._text_names: list[str] = []
         self._visual_names: list[str] = []
+        self._active_names_cache: tuple[str, ...] = ()
         self._prompt_generation = 0
+        self._native_infer_image = getattr(native_main_runtime, "infer_image", None)
+        self._native_infer_tensor = getattr(native_main_runtime, "infer_tensor", None)
+        self._native_infer_image_postprocessed = getattr(native_main_runtime, "infer_image_postprocessed", None)
+        self._native_infer_tensor_postprocessed = getattr(native_main_runtime, "infer_tensor_postprocessed", None)
+        if native_main_runtime is not None:
+            self._main_output_names_cache: tuple[str, ...] = tuple(native_main_runtime.output_names)
+        elif main_runtime is not None:
+            self._main_output_names_cache = tuple(main_runtime.output_names)
+        else:
+            self._main_output_names_cache = ()
         LOGGER.info(
             "Initialized YOLOEEngine with artifact_dir='%s', task=%s, device=%s native=%s",
             self.artifact_dir,
@@ -193,19 +203,29 @@ class YOLOEEngine:
             self._visual_names,
         )
 
-    def _active_prompt_names(self) -> list[str]:
-        names = [*self._text_names, *self._visual_names]
+    def _active_prompt_names(self) -> tuple[str, ...]:
+        names = getattr(self, "_active_names_cache", ())
         if not names:
-            raise RuntimeError("No prompt embeddings are active. Call set_classes() or set_visual_prompts() first.")
+            names = (*self._text_names, *self._visual_names)
+            if not names:
+                raise RuntimeError("No prompt embeddings are active. Call set_classes() or set_visual_prompts() first.")
+            self._active_names_cache = names
         return names
 
     @property
-    def _main_output_names(self) -> list[str]:
+    def _main_output_names(self) -> tuple[str, ...]:
+        cached = getattr(self, "_main_output_names_cache", ())
+        if cached:
+            return cached
         if self.native_main_runtime is not None:
-            return list(self.native_main_runtime.output_names)
+            cached = tuple(self.native_main_runtime.output_names)
+            self._main_output_names_cache = cached
+            return cached
         if self.main_runtime is None:
             raise RuntimeError("Main runtime is not initialized")
-        return self.main_runtime.output_names
+        cached = tuple(self.main_runtime.output_names)
+        self._main_output_names_cache = cached
+        return cached
 
     @property
     def _main_fp16(self) -> bool:
@@ -242,6 +262,7 @@ class YOLOEEngine:
 
     def _bump_prompt_generation(self) -> None:
         self._prompt_generation += 1
+        self._active_names_cache = ()
 
     def _describe_source(self, source: object) -> str:
         if isinstance(source, SourceItem):
@@ -424,17 +445,17 @@ class YOLOEEngine:
     @property
     def active_names(self) -> list[str]:
         try:
-            _, names = self._active_prompt_embeddings()
-            return names
+            return list(self._active_prompt_names())
         except RuntimeError:
             return []
 
     def _postprocess_predictions(
         self,
         outputs: dict[str, torch.Tensor],
-        sample,
+        original_image: np.ndarray,
+        path: str,
         input_shape: tuple[int, int],
-        names: list[str],
+        names: Sequence[str],
         conf: float,
         iou: float,
         max_det: int,
@@ -458,22 +479,20 @@ class YOLOEEngine:
             if preds.shape[0] == 0:
                 masks = None
             elif retina_masks:
-                preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], sample.original.shape)
-                masks = ops.process_mask_native(proto, preds[:, 6:], preds[:, :4], sample.original.shape[:2])
+                preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], original_image.shape)
+                masks = ops.process_mask_native(proto, preds[:, 6:], preds[:, :4], original_image.shape[:2])
             else:
                 masks = ops.process_mask(proto, preds[:, 6:], preds[:, :4], input_shape, upsample=True)
-                preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], sample.original.shape)
+                preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], original_image.shape)
             if masks is not None:
                 keep = masks.amax((-2, -1)) > 0
                 if not bool(torch.all(keep)):
                     preds = preds[keep]
                     masks = masks[keep]
-            return Results(
-                sample.original, path=sample.path, names=names_map, boxes=preds[:, :6], masks=masks, speed=speed
-            )
+            return Results(original_image, path=path, names=names_map, boxes=preds[:, :6], masks=masks, speed=speed)
 
-        preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], sample.original.shape)
-        return Results(sample.original, path=sample.path, names=names_map, boxes=preds[:, :6], speed=speed)
+        preds[:, :4] = ops.scale_boxes(input_shape, preds[:, :4], original_image.shape)
+        return Results(original_image, path=path, names=names_map, boxes=preds[:, :6], speed=speed)
 
     def _predict_one(
         self,
@@ -495,36 +514,46 @@ class YOLOEEngine:
             len(names),
             imgsz,
         )
-        preprocess_start = time.perf_counter()
-        sample = SimpleNamespace(original=item.image, path=item.path)
         if self.native_main_runtime is not None:
-            result = self._run_native_result(
-                sample=sample,
-                names=names,
-                conf=conf,
-                iou=iou,
-                max_det=max_det,
-                retina_masks=retina_masks,
-                raw_call=lambda: self.native_main_runtime.infer_image(item.image, imgsz[0], imgsz[1]),
-                postprocessed_call=(
-                    lambda: self.native_main_runtime.infer_image_postprocessed(
-                        item.image,
-                        imgsz[0],
-                        imgsz[1],
-                        int(item.image.shape[0]),
-                        int(item.image.shape[1]),
-                        float(conf),
-                        float(iou),
-                        int(max_det),
-                        bool(retina_masks),
-                    )
+            native_infer_image_postprocessed = self._native_infer_image_postprocessed
+            if native_infer_image_postprocessed is not None:
+                native_outputs = native_infer_image_postprocessed(
+                    item.image,
+                    imgsz[0],
+                    imgsz[1],
+                    int(item.image.shape[0]),
+                    int(item.image.shape[1]),
+                    float(conf),
+                    float(iou),
+                    int(max_det),
+                    bool(retina_masks),
                 )
-                if hasattr(self.native_main_runtime, "infer_image_postprocessed")
-                else None,
-            )
+                result = self._build_native_postprocessed_result(
+                    native_outputs=native_outputs,
+                    original_image=item.image,
+                    path=item.path,
+                    names=names,
+                    preprocess_ms=float(native_outputs["preprocess_ms"]),
+                    inference_ms=float(native_outputs["inference_ms"]),
+                )
+            else:
+                native_infer_image = self._native_infer_image
+                if native_infer_image is None:
+                    raise RuntimeError("Native main runtime does not support image inference")
+                result = self._build_native_legacy_result(
+                    native_outputs=native_infer_image(item.image, imgsz[0], imgsz[1]),
+                    original_image=item.image,
+                    path=item.path,
+                    names=names,
+                    conf=conf,
+                    iou=iou,
+                    max_det=max_det,
+                    retina_masks=retina_masks,
+                )
         else:
             if self.main_runtime is None:
                 raise RuntimeError("Main runtime is not initialized")
+            preprocess_start = time.perf_counter()
             sample = preprocess_image(
                 item,
                 imgsz=imgsz,
@@ -548,7 +577,8 @@ class YOLOEEngine:
             speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
             result = self._postprocess_predictions(
                 outputs=outputs,
-                sample=sample,
+                original_image=sample.original,
+                path=sample.path,
                 input_shape=input_shape,
                 names=names,
                 conf=conf,
@@ -570,33 +600,32 @@ class YOLOEEngine:
         )
         return result
 
-    def _resolve_original_sample(
+    def _resolve_original_image_path(
         self,
         original_image: SourceItem | PreparedFrameMetadata | object | None,
         path: str | None,
         input_shape: tuple[int, int],
-    ) -> SimpleNamespace:
+    ) -> tuple[np.ndarray, str]:
         if isinstance(original_image, SourceItem):
-            return SimpleNamespace(original=original_image.image, path=path or original_image.path)
+            return original_image.image, path or original_image.path
         if isinstance(original_image, PreparedFrameMetadata):
             resolved_path = path or original_image.path or "tensor0"
             if original_image.preview_image is not None:
-                return SimpleNamespace(original=original_image.preview_image, path=resolved_path)
-            fallback_image = np.zeros((*original_image.original_shape, 3), dtype=np.uint8)
-            return SimpleNamespace(original=fallback_image, path=resolved_path)
+                return original_image.preview_image, resolved_path
+            return np.zeros((*original_image.original_shape, 3), dtype=np.uint8), resolved_path
         if original_image is not None:
             item = normalize_source(original_image, default_prefix="tensor")[0]
-            return SimpleNamespace(original=item.image, path=path or item.path)
+            return item.image, path or item.path
 
         fallback_path = path or "tensor0"
-        fallback_image = np.zeros((input_shape[0], input_shape[1], 3), dtype=np.uint8)
-        return SimpleNamespace(original=fallback_image, path=fallback_path)
+        return np.zeros((input_shape[0], input_shape[1], 3), dtype=np.uint8), fallback_path
 
     def _build_native_postprocessed_result(
         self,
         native_outputs: dict[str, object],
-        sample,
-        names: list[str],
+        original_image: np.ndarray,
+        path: str,
+        names: Sequence[str],
         preprocess_ms: float,
         inference_ms: float,
     ) -> Results:
@@ -608,13 +637,14 @@ class YOLOEEngine:
         names_map = {index: name for index, name in enumerate(names)}
         boxes = from_dlpack(native_outputs["boxes"])
         masks = from_dlpack(native_outputs["masks"]) if "masks" in native_outputs else None
-        return Results(sample.original, path=sample.path, names=names_map, boxes=boxes, masks=masks, speed=speed)
+        return Results(original_image, path=path, names=names_map, boxes=boxes, masks=masks, speed=speed)
 
     def _build_native_legacy_result(
         self,
         native_outputs: dict[str, object],
-        sample,
-        names: list[str],
+        original_image: np.ndarray,
+        path: str,
+        names: Sequence[str],
         conf: float,
         iou: float,
         max_det: int,
@@ -633,7 +663,8 @@ class YOLOEEngine:
         postprocess_start = time.perf_counter()
         result = self._postprocess_predictions(
             outputs=outputs,
-            sample=sample,
+            original_image=original_image,
+            path=path,
             input_shape=resolved_input_shape,
             names=names,
             conf=conf,
@@ -645,39 +676,6 @@ class YOLOEEngine:
         speed["postprocess"] = (time.perf_counter() - postprocess_start) * 1000.0
         result.speed = speed
         return result
-
-    def _run_native_result(
-        self,
-        sample,
-        names: list[str],
-        conf: float,
-        iou: float,
-        max_det: int,
-        retina_masks: bool,
-        *,
-        input_shape: tuple[int, int] | None = None,
-        raw_call: Callable[[], dict[str, object]],
-        postprocessed_call: Callable[[], dict[str, object]] | None = None,
-    ) -> Results:
-        if postprocessed_call is not None:
-            native_outputs = postprocessed_call()
-            return self._build_native_postprocessed_result(
-                native_outputs=native_outputs,
-                sample=sample,
-                names=names,
-                preprocess_ms=float(native_outputs["preprocess_ms"]),
-                inference_ms=float(native_outputs["inference_ms"]),
-            )
-        return self._build_native_legacy_result(
-            native_outputs=raw_call(),
-            sample=sample,
-            names=names,
-            conf=conf,
-            iou=iou,
-            max_det=max_det,
-            retina_masks=retina_masks,
-            input_shape=input_shape,
-        )
 
     def _predict_prepared_tensor(
         self,
@@ -702,56 +700,77 @@ class YOLOEEngine:
                 "Prepared tensor inputs must have shape (3, H, W) or (1, 3, H, W) before they enter the fast path"
             )
 
-        current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
+        current_stream: int | None = None
         producer_stream = item.producer_stream
         if image_tensor.device.type != "cuda":
             image_tensor = image_tensor.to(device=self.device)
+            current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
         elif image_tensor.device != self.device:
             image_tensor = image_tensor.to(device=self.device)
+            current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
         target_dtype = torch.float16 if self._main_fp16 else torch.float32
         if image_tensor.dtype != target_dtype:
             image_tensor = image_tensor.to(dtype=target_dtype)
+            if current_stream is None:
+                current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
-        contiguous_tensor = image_tensor.contiguous()
-        if contiguous_tensor.data_ptr() != image_tensor.data_ptr():
+        if not image_tensor.is_contiguous():
+            image_tensor = image_tensor.contiguous()
+            if current_stream is None:
+                current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
-        image_tensor = contiguous_tensor
         if producer_stream is None:
+            if current_stream is None:
+                current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
 
         input_shape = (int(image_tensor.shape[2]), int(image_tensor.shape[3]))
-        sample = self._resolve_original_sample(item.original_image, item.path, input_shape)
+        original_image, result_path = self._resolve_original_image_path(item.original_image, item.path, input_shape)
         if self.native_main_runtime is not None:
-            result = self._run_native_result(
-                sample=sample,
-                names=names,
-                conf=conf,
-                iou=iou,
-                max_det=max_det,
-                retina_masks=retina_masks,
-                input_shape=input_shape,
-                raw_call=lambda: self.native_main_runtime.infer_tensor(
-                    int(image_tensor.data_ptr()), input_shape[0], input_shape[1], producer_stream
-                ),
-                postprocessed_call=(
-                    lambda: self.native_main_runtime.infer_tensor_postprocessed(
+            native_infer_tensor_postprocessed = self._native_infer_tensor_postprocessed
+            if native_infer_tensor_postprocessed is not None:
+                native_outputs = native_infer_tensor_postprocessed(
+                    int(image_tensor.data_ptr()),
+                    input_shape[0],
+                    input_shape[1],
+                    int(original_image.shape[0]),
+                    int(original_image.shape[1]),
+                    float(conf),
+                    float(iou),
+                    int(max_det),
+                    bool(retina_masks),
+                    producer_stream,
+                )
+                result = self._build_native_postprocessed_result(
+                    native_outputs=native_outputs,
+                    original_image=original_image,
+                    path=result_path,
+                    names=names,
+                    preprocess_ms=float(native_outputs["preprocess_ms"]),
+                    inference_ms=float(native_outputs["inference_ms"]),
+                )
+            else:
+                native_infer_tensor = self._native_infer_tensor
+                if native_infer_tensor is None:
+                    raise RuntimeError("Native main runtime does not support tensor inference")
+                result = self._build_native_legacy_result(
+                    native_outputs=native_infer_tensor(
                         int(image_tensor.data_ptr()),
                         input_shape[0],
                         input_shape[1],
-                        int(sample.original.shape[0]),
-                        int(sample.original.shape[1]),
-                        float(conf),
-                        float(iou),
-                        int(max_det),
-                        bool(retina_masks),
                         producer_stream,
-                    )
+                    ),
+                    original_image=original_image,
+                    path=result_path,
+                    names=names,
+                    conf=conf,
+                    iou=iou,
+                    max_det=max_det,
+                    retina_masks=retina_masks,
+                    input_shape=input_shape,
                 )
-                if hasattr(self.native_main_runtime, "infer_tensor_postprocessed")
-                else None,
-            )
         else:
             if self.main_runtime is None:
                 raise RuntimeError("Main runtime is not initialized")
@@ -769,7 +788,8 @@ class YOLOEEngine:
             speed = {"preprocess": preprocess_ms, "inference": inference_ms, "postprocess": 0.0}
             result = self._postprocess_predictions(
                 outputs=outputs,
-                sample=sample,
+                original_image=original_image,
+                path=result_path,
                 input_shape=input_shape,
                 names=names,
                 conf=conf,
@@ -783,7 +803,7 @@ class YOLOEEngine:
         LOGGER.debug(
             "Completed prepared-tensor inference on '%s': input_shape=%s detections=%d "
             "pre=%.1fms inf=%.1fms post=%.1fms",
-            sample.path,
+            result_path,
             input_shape,
             int(result.boxes.data.shape[0]) if result.boxes is not None else 0,
             result.speed["preprocess"],
