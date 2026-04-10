@@ -4,12 +4,13 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import yaml
 from ultralytics.engine.results import Results
 from ultralytics.utils import IterableSimpleNamespace
 
-from .inputs import InferenceSourceItem, PreparedTensorInput, normalize_inference_source
+from .inputs import InferenceSourceItem, PreparedTensorInput, normalize_single_inference_source
 from .logging_utils import get_logger
 from .source import SourceItem
 
@@ -116,7 +117,10 @@ def _apply_tracking_to_result(result: Results, tracker_backend) -> Results:
     if len(tracks) == 0:
         return result
 
-    keep_indices = tracks[:, -1].astype(int).tolist()
+    keep_indices_np = tracks[:, -1].astype(np.int64, copy=False)
+    keep_indices = keep_indices_np
+    if torch.is_tensor(result.boxes.data) and result.boxes.data.device.type != "cpu":
+        keep_indices = torch.as_tensor(keep_indices_np, device=result.boxes.data.device)
     tracked_result = result[keep_indices]
     dtype = result.boxes.data.dtype if torch.is_tensor(result.boxes.data) else torch.float32
     tracked_boxes = torch.as_tensor(tracks[:, :-1], dtype=dtype)
@@ -190,18 +194,17 @@ class YOLOETrackerSession:
     ) -> Results:
         self._reset_if_needed(source_key)
         resolved_max_det = int(max_det or self.engine.metadata.max_det)
-        items = normalize_inference_source(
+        item = normalize_single_inference_source(
             frame,
             default_prefix="frame",
             input_hint=input_hint,
             cuda=cuda,
             original_image=original_image,
             path=path,
+            multiple_error="YOLOETrackerSession.update expects a single frame input",
         )
-        if len(items) != 1:
-            raise ValueError("YOLOETrackerSession.update expects a single frame input")
         result = self.engine._predict_input_entry(
-            item=items[0],
+            item=item,
             imgsz=imgsz,
             conf=conf,
             iou=iou,

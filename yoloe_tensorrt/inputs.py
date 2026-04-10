@@ -86,6 +86,37 @@ def normalize_inference_source(
     return items
 
 
+def normalize_single_inference_source(
+    source: object,
+    *,
+    default_prefix: str = "image",
+    input_hint: str | None = None,
+    cuda: bool | None = None,
+    original_image: SourceItem | object | None = None,
+    path: str | None = None,
+    multiple_error: str = "Expected a single inference source item",
+) -> InferenceSourceItem:
+    items = iter_inference_sources(
+        source,
+        default_prefix=default_prefix,
+        input_hint=input_hint,
+        cuda=cuda,
+        allow_unbounded_live=False,
+        original_image=original_image,
+        path=path,
+    )
+    try:
+        first = next(items)
+    except StopIteration as exc:
+        raise ValueError("No images were found in the provided source") from exc
+    try:
+        next(items)
+    except StopIteration:
+        LOGGER.debug("Normalized 1 inference source item")
+        return first
+    raise ValueError(multiple_error)
+
+
 def iter_inference_sources(
     source: object,
     *,

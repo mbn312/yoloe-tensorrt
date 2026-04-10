@@ -10,6 +10,7 @@ from yoloe_tensorrt.inputs import (
     PreparedTensorInput,
     iter_inference_sources,
     normalize_inference_source,
+    normalize_single_inference_source,
     validate_prepared_tensor,
 )
 from yoloe_tensorrt.preprocess import preprocess_image
@@ -206,3 +207,29 @@ def test_iter_inference_sources_allows_finite_live_sources_when_unbounded_live_d
     assert len(items) == 1
     assert isinstance(items[0], SourceItem)
     assert items[0].path == "frame0"
+
+
+def test_normalize_single_inference_source_returns_one_item() -> None:
+    item = normalize_single_inference_source(np.zeros((4, 4, 3), dtype=np.uint8))
+
+    assert isinstance(item, SourceItem)
+    assert item.path == "image0"
+
+
+def test_normalize_single_inference_source_rejects_empty_iterables() -> None:
+    with pytest.raises(ValueError, match="No images were found"):
+        normalize_single_inference_source([])
+
+
+def test_normalize_single_inference_source_rejects_multiple_items_lazily() -> None:
+    consumed = {"count": 0}
+
+    def _source():
+        for _ in range(3):
+            consumed["count"] += 1
+            yield np.zeros((4, 4, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="single frame"):
+        normalize_single_inference_source(_source(), multiple_error="single frame")
+
+    assert consumed["count"] == 2
