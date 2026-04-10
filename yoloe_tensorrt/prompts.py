@@ -176,9 +176,33 @@ def _preserve_unique_names(names: list[str]) -> tuple[np.ndarray, list[str]]:
     return np.asarray(ids, dtype=np.int32), resolved
 
 
-def _resize_masks(
+def resolve_visual_prompt_categories(
+    prompt_count: int,
+    classes: list[str] | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    if prompt_count <= 0:
+        raise ValueError("visual prompts must contain at least one prompt")
+    if classes is None:
+        names = [f"object{i}" for i in range(prompt_count)]
+        return np.arange(prompt_count, dtype=np.int32), names
+    if len(classes) != prompt_count:
+        raise ValueError("classes must match the number of visual prompts")
+    return _preserve_unique_names(classes)
+
+
+def normalize_visual_prompt_boxes(bboxes: np.ndarray | list[list[float]]) -> np.ndarray:
+    boxes = np.asarray(bboxes, dtype=np.float32)
+    if boxes.ndim == 1:
+        boxes = boxes[None, :]
+    if boxes.ndim != 2 or boxes.shape[1] != 4:
+        raise ValueError(f"Expected bboxes with shape (N, 4), got {boxes.shape}")
+    if boxes.shape[0] == 0:
+        raise ValueError("bboxes must not be empty")
+    return boxes
+
+
+def normalize_visual_prompt_masks(
     masks: np.ndarray | list[np.ndarray] | torch.Tensor,
-    dst_shape: tuple[int, int],
 ) -> np.ndarray:
     if isinstance(masks, torch.Tensor):
         masks = masks.detach().cpu().numpy()
@@ -187,6 +211,16 @@ def _resize_masks(
         masks_array = masks_array[None, ...]
     if masks_array.ndim != 3:
         raise ValueError(f"Expected masks with shape (N, H, W), got {masks_array.shape}")
+    if masks_array.shape[0] == 0:
+        raise ValueError("masks must not be empty")
+    return masks_array
+
+
+def _resize_masks(
+    masks: np.ndarray | list[np.ndarray] | torch.Tensor,
+    dst_shape: tuple[int, int],
+) -> np.ndarray:
+    masks_array = normalize_visual_prompt_masks(masks)
     letterbox = LetterBox(
         new_shape=dst_shape,
         auto=False,
@@ -196,7 +230,10 @@ def _resize_masks(
     )
     resized = []
     for mask in masks_array:
-        output = letterbox(image=np.asarray(mask, dtype=np.uint8))
+        mask_array = np.asarray(mask, dtype=np.uint8)
+        if mask_array.ndim == 2:
+            mask_array = mask_array[..., None]
+        output = letterbox(image=mask_array)
         if output.ndim == 3 and output.shape[-1] == 1:
             output = output[..., 0]
         resized.append(output)
@@ -220,19 +257,9 @@ def build_visual_prompt_batch(
     )
 
     if bboxes is not None:
-        boxes = np.asarray(bboxes, dtype=np.float32)
-        if boxes.ndim == 1:
-            boxes = boxes[None, :]
-        if boxes.ndim != 2 or boxes.shape[1] != 4:
-            raise ValueError(f"Expected bboxes with shape (N, 4), got {boxes.shape}")
+        boxes = normalize_visual_prompt_boxes(bboxes)
         prompt_count = boxes.shape[0]
-        if classes is None:
-            names = [f"object{i}" for i in range(prompt_count)]
-            category = np.arange(prompt_count, dtype=np.int32)
-        else:
-            if len(classes) != prompt_count:
-                raise ValueError("classes must match the number of bboxes")
-            category, names = _preserve_unique_names(classes)
+        category, names = resolve_visual_prompt_categories(prompt_count, classes)
         src_shape = image.shape[:2]
         gain = min(dst_shape[0] / src_shape[0], dst_shape[1] / src_shape[1])
         boxes = boxes.copy()
@@ -247,13 +274,7 @@ def build_visual_prompt_batch(
     else:
         resized_masks = _resize_masks(masks, dst_shape)
         prompt_count = resized_masks.shape[0]
-        if classes is None:
-            names = [f"object{i}" for i in range(prompt_count)]
-            category = np.arange(prompt_count, dtype=np.int32)
-        else:
-            if len(classes) != prompt_count:
-                raise ValueError("classes must match the number of masks")
-            category, names = _preserve_unique_names(classes)
+        category, names = resolve_visual_prompt_categories(prompt_count, classes)
         visuals = LoadVisualPrompt(scale_factor=1 / visual_stride).get_visuals(
             category,
             dst_shape,

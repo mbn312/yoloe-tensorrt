@@ -21,7 +21,10 @@ from .inputs import (
     validate_prepared_tensor,
 )
 from .logging_utils import get_logger
-from .native_backend import build_native_main_runtime
+from .native_backend import (
+    build_native_main_runtime,
+    build_native_visual_runtime,
+)
 from .preprocess import normalize_imgsz, preprocess_image
 from .prompts import (
     TextPromptEncoder,
@@ -29,7 +32,10 @@ from .prompts import (
     compile_text_embeddings,
     concat_prompt_embeddings,
     load_prompt_projector,
+    normalize_visual_prompt_boxes,
+    normalize_visual_prompt_masks,
     resolve_text_asset_path,
+    resolve_visual_prompt_categories,
 )
 from .source import PreparedFrameMetadata, SourceItem, normalize_source
 from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
@@ -49,6 +55,7 @@ class YOLOEEngine:
         device: str | torch.device = "cuda:0",
         text_encoder_path: str | Path | None = None,
         native_main_runtime: object | None = None,
+        native_visual_runtime: object | None = None,
     ) -> None:
         self.artifact_dir = Path(artifact_dir)
         self.metadata = metadata
@@ -56,6 +63,7 @@ class YOLOEEngine:
         self.main_runtime = main_runtime
         self.native_main_runtime = native_main_runtime
         self.visual_runtime = visual_runtime
+        self.native_visual_runtime = native_visual_runtime
         self.prompt_projector = prompt_projector
         self._text_encoder_path = Path(text_encoder_path) if text_encoder_path else None
         self._text_encoder: TextPromptEncoder | None = None
@@ -138,18 +146,33 @@ class YOLOEEngine:
             prompt_input_name=metadata.prompt_input_name,
             device=device,
         )
+        native_visual_runtime = None
+        if visual_engine and visual_engine.is_file():
+            try:
+                native_visual_runtime = build_native_visual_runtime(
+                    visual_engine,
+                    image_input_name=metadata.image_input_name,
+                    visual_input_name=metadata.visual_input_name,
+                    visual_stride=metadata.visual_stride,
+                    device=device,
+                )
+            except Exception as exc:
+                LOGGER.warning("Native visual runtime unavailable; falling back to Python TensorRT path: %s", exc)
 
         return cls(
             artifact_dir=artifact_root,
             metadata=metadata,
             main_runtime=None if native_main_runtime is not None else TensorRTRuntime(main_engine, device=device),
-            visual_runtime=TensorRTRuntime(visual_engine, device=device)
-            if visual_engine and visual_engine.is_file()
-            else None,
+            visual_runtime=(
+                None
+                if native_visual_runtime is not None or not (visual_engine and visual_engine.is_file())
+                else TensorRTRuntime(visual_engine, device=device)
+            ),
             prompt_projector=load_prompt_projector(projector_path, device=torch.device(device)),
             device=device,
             text_encoder_path=preferred_text_path,
             native_main_runtime=native_main_runtime,
+            native_visual_runtime=native_visual_runtime,
         )
 
     def _get_text_encoder(self) -> TextPromptEncoder:
@@ -169,6 +192,12 @@ class YOLOEEngine:
             self._visual_prompt_embeddings,
             self._visual_names,
         )
+
+    def _active_prompt_names(self) -> list[str]:
+        names = [*self._text_names, *self._visual_names]
+        if not names:
+            raise RuntimeError("No prompt embeddings are active. Call set_classes() or set_visual_prompts() first.")
+        return names
 
     @property
     def _main_output_names(self) -> list[str]:
@@ -194,10 +223,48 @@ class YOLOEEngine:
         except RuntimeError:
             self.native_main_runtime.clear_prompt_embeddings()
             return
-        self.native_main_runtime.set_prompt_embeddings(embeddings.detach().float().cpu().contiguous().numpy())
+        tensor = embeddings.detach().contiguous()
+        if hasattr(self.native_main_runtime, "set_prompt_embeddings_device"):
+            target_dtype = (
+                torch.float16 if bool(getattr(self.native_main_runtime, "prompt_fp16", False)) else torch.float32
+            )
+            if tensor.dtype != target_dtype:
+                tensor = tensor.to(device=self.device, dtype=target_dtype)
+            producer_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
+            self.native_main_runtime.set_prompt_embeddings_device(
+                int(tensor.data_ptr()),
+                int(tensor.shape[1]),
+                int(tensor.shape[2]),
+                producer_stream,
+            )
+            return
+        self.native_main_runtime.set_prompt_embeddings(tensor.float().cpu().contiguous().numpy())
 
     def _bump_prompt_generation(self) -> None:
         self._prompt_generation += 1
+
+    def _describe_source(self, source: object) -> str:
+        if isinstance(source, SourceItem):
+            return str(source.path)
+        if isinstance(source, np.ndarray):
+            return f"ndarray(shape={tuple(int(v) for v in source.shape)}, dtype={source.dtype})"
+        if isinstance(source, torch.Tensor):
+            return f"tensor(shape={tuple(int(v) for v in source.shape)}, dtype={source.dtype}, device={source.device})"
+        return str(source)
+
+    def _native_visual_image(self, image: np.ndarray) -> np.ndarray:
+        if image.dtype == np.uint8:
+            return np.ascontiguousarray(image)
+        if np.issubdtype(image.dtype, np.floating):
+            min_value = float(image.min())
+            max_value = float(image.max())
+            if 0.0 <= min_value and max_value <= 1.0:
+                return np.ascontiguousarray(np.rint(image * 255.0).clip(0.0, 255.0).astype(np.uint8))
+            if 0.0 <= min_value and max_value <= 255.0:
+                return np.ascontiguousarray(np.rint(image).clip(0.0, 255.0).astype(np.uint8))
+        raise ValueError(
+            "Native visual prompts require uint8 reference images or non-negative float images in 0..1 or 0..255 range"
+        )
 
     def clear_prompts(self) -> None:
         self._text_prompt_embeddings = None
@@ -256,35 +323,63 @@ class YOLOEEngine:
         classes: list[str] | None = None,
         imgsz: int | tuple[int, int] | list[int] | None = None,
     ) -> None:
-        if self.visual_runtime is None:
+        if self.native_visual_runtime is None and self.visual_runtime is None:
             raise RuntimeError("This artifact bundle does not include a visual-prompt engine")
-        LOGGER.info("Setting visual prompts from '%s'", refer_image)
+        if bboxes is None and masks is None:
+            raise ValueError("Either bboxes or masks must be provided")
+        LOGGER.info("Setting visual prompts from '%s'", self._describe_source(refer_image))
         source_item = normalize_source(refer_image, default_prefix="refer")[0]
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
-        sample = preprocess_image(
-            source_item,
-            imgsz=target_size,
-            device=self.device,
-            fp16=self.visual_runtime.fp16,
-            stride=self.metadata.stride,
-        )
-        prompt_batch = build_visual_prompt_batch(
-            image=sample.original,
-            dst_shape=sample.transformed.shape[:2],
-            visual_stride=self.metadata.visual_stride,
-            bboxes=bboxes,
-            masks=masks,
-            classes=classes,
-        )
-        outputs = self.visual_runtime.infer(
-            {
-                self.metadata.image_input_name: sample.tensor,
-                self.metadata.visual_input_name: prompt_batch.tensor.to(self.device),
-            }
-        )
-        prompt_output_name = self.visual_runtime.output_names[0]
-        self._visual_prompt_embeddings = outputs[prompt_output_name].float()
-        self._visual_names = prompt_batch.names
+        boxes = normalize_visual_prompt_boxes(bboxes) if bboxes is not None else None
+        masks_array = None
+        if boxes is not None:
+            prompt_count = int(boxes.shape[0])
+        elif masks is not None:
+            masks_array = normalize_visual_prompt_masks(masks)
+            prompt_count = int(masks_array.shape[0])
+        else:
+            prompt_count = 0
+        categories, names = resolve_visual_prompt_categories(prompt_count, classes)
+
+        if self.native_visual_runtime is not None:
+            native_outputs = self.native_visual_runtime.infer_image(
+                self._native_visual_image(source_item.image),
+                int(target_size[0]),
+                int(target_size[1]),
+                categories,
+                boxes,
+                masks_array,
+            )
+            prompt_output_name = self.native_visual_runtime.output_names[0]
+            prompt_embeddings = from_dlpack(native_outputs[prompt_output_name]).float().contiguous().clone()
+        else:
+            assert self.visual_runtime is not None
+            sample = preprocess_image(
+                source_item,
+                imgsz=target_size,
+                device=self.device,
+                fp16=self.visual_runtime.fp16,
+                stride=self.metadata.stride,
+            )
+            prompt_batch = build_visual_prompt_batch(
+                image=sample.original,
+                dst_shape=sample.transformed.shape[:2],
+                visual_stride=self.metadata.visual_stride,
+                bboxes=boxes,
+                masks=masks_array,
+                classes=classes,
+            )
+            outputs = self.visual_runtime.infer(
+                {
+                    self.metadata.image_input_name: sample.tensor,
+                    self.metadata.visual_input_name: prompt_batch.tensor.to(self.device),
+                }
+            )
+            prompt_output_name = self.visual_runtime.output_names[0]
+            prompt_embeddings = outputs[prompt_output_name].float()
+            names = prompt_batch.names
+        self._visual_prompt_embeddings = prompt_embeddings
+        self._visual_names = names
         self._bump_prompt_generation()
         self._sync_native_prompt_embeddings()
         LOGGER.info(
@@ -309,18 +404,21 @@ class YOLOEEngine:
                 self.metadata.prompt_input_name: (1, prompt_count, self.metadata.embed_dim),
             }
             self.main_runtime.warmup(shapes=shapes)
-        if self.visual_runtime is not None and self.metadata.visual_profile is not None:
-            self.visual_runtime.warmup(
-                shapes={
-                    self.metadata.image_input_name: (1, 3, target[0], target[1]),
-                    self.metadata.visual_input_name: (
-                        1,
-                        self.metadata.visual_profile.optimum[1],
-                        target[0] // self.metadata.visual_stride,
-                        target[1] // self.metadata.visual_stride,
-                    ),
-                }
-            )
+        if self.metadata.visual_profile is not None:
+            if self.native_visual_runtime is not None:
+                self.native_visual_runtime.warmup(target[0], target[1], self.metadata.visual_profile.optimum[1], 2)
+            elif self.visual_runtime is not None:
+                self.visual_runtime.warmup(
+                    shapes={
+                        self.metadata.image_input_name: (1, 3, target[0], target[1]),
+                        self.metadata.visual_input_name: (
+                            1,
+                            self.metadata.visual_profile.optimum[1],
+                            target[0] // self.metadata.visual_stride,
+                            target[1] // self.metadata.visual_stride,
+                        ),
+                    }
+                )
         LOGGER.info("YOLOEEngine warmup complete")
 
     @property
@@ -386,7 +484,11 @@ class YOLOEEngine:
         max_det: int,
         retina_masks: bool,
     ) -> Results:
-        prompt_embeddings, names = self._active_prompt_embeddings()
+        if self.native_main_runtime is not None:
+            prompt_embeddings = None
+            names = self._active_prompt_names()
+        else:
+            prompt_embeddings, names = self._active_prompt_embeddings()
         LOGGER.debug(
             "Running inference on '%s' with %d active prompt class(es) at imgsz=%s",
             item.path,
@@ -585,7 +687,11 @@ class YOLOEEngine:
         max_det: int,
         retina_masks: bool,
     ) -> Results:
-        prompt_embeddings, names = self._active_prompt_embeddings()
+        if self.native_main_runtime is not None:
+            prompt_embeddings = None
+            names = self._active_prompt_names()
+        else:
+            prompt_embeddings, names = self._active_prompt_embeddings()
 
         image_tensor = item.tensor
         validate_prepared_tensor(image_tensor)

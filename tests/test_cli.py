@@ -59,3 +59,4 @@ def test_benchmark_cli_displays_help() -> None:
     assert result.returncode == 0
     assert "Benchmark host-image and CUDA-tensor inference" in result.stdout
     assert "--mode" in result.stdout
+    assert "--visual-prompts" in result.stdout
