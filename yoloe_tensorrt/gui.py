@@ -6,7 +6,7 @@ import re
 import time
 import tkinter as tk
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 import cv2
 from PIL import Image, ImageTk
@@ -36,9 +36,12 @@ DEFAULT_GUI_CAMERA_FPS = int(os.environ.get("YOLOE_TRT_GUI_CAMERA_FPS", "30"))
 DEFAULT_GUI_CAMERA_TIMEOUT_S = float(os.environ.get("YOLOE_TRT_GUI_CAMERA_TIMEOUT", "5.0"))
 DEFAULT_GUI_PREFIX = "camera"
 DEFAULT_GUI_CONF = 0.1
+DEFAULT_GUI_LABELS_VIEWPORT_HEIGHT = int(os.environ.get("YOLOE_TRT_GUI_LABELS_VIEWPORT_HEIGHT", "180"))
 DEFAULT_GUI_WORKSPACE_BYTES = int(os.environ.get("YOLOE_TRT_GUI_WORKSPACE_BYTES", str(512 << 20)))
 DEFAULT_GUI_TRACKING = os.environ.get("YOLOE_TRT_GUI_TRACKING", "1").lower() not in {"0", "false", "no"}
 DEFAULT_GUI_TRACKER = normalize_tracker_name(os.environ.get("YOLOE_TRT_GUI_TRACKER", DEFAULT_TRACKER))
+DEFAULT_GUI_SOURCE_PRESETS = ("videotest://ball",)
+CUSTOM_GUI_SOURCE_OPTION = "Custom..."
 
 
 def parse_label_text(text: str) -> list[str]:
@@ -66,8 +69,68 @@ def default_gui_model_spec() -> str:
     return os.environ.get("YOLOE_TRT_GUI_MODEL", default_example_model_spec())
 
 
+def discover_gui_camera_sources(
+    *,
+    device_dir: str | Path = "/dev",
+    presets: Sequence[str] = DEFAULT_GUI_SOURCE_PRESETS,
+) -> list[str]:
+    root = Path(device_dir)
+
+    def _sort_key(path: Path) -> tuple[str, int, str]:
+        match = re.search(r"(\d+)$", path.name)
+        if match is None:
+            return (path.name, -1, path.name)
+        prefix = path.name[: match.start()]
+        return (prefix, int(match.group(1)), path.name)
+
+    sources = [str(path) for path in sorted(root.glob("video*"), key=_sort_key) if path.exists()]
+    for preset in presets:
+        value = str(preset).strip()
+        if value and value not in sources:
+            sources.append(value)
+    sources.append(CUSTOM_GUI_SOURCE_OPTION)
+    return sources
+
+
+def split_gui_source_selection(source_spec: str, available_sources: Sequence[str]) -> tuple[str, str]:
+    source = str(source_spec).strip()
+    known_sources = [option for option in available_sources if option != CUSTOM_GUI_SOURCE_OPTION]
+    if source in known_sources:
+        return source, ""
+    return CUSTOM_GUI_SOURCE_OPTION, source
+
+
+def resolve_gui_source_selection(
+    selected_source: str,
+    custom_source: str,
+    available_sources: Sequence[str],
+) -> tuple[str, str, str]:
+    known_sources = [option for option in available_sources if option != CUSTOM_GUI_SOURCE_OPTION]
+    selected = str(selected_source).strip()
+    if selected and selected != CUSTOM_GUI_SOURCE_OPTION:
+        if selected not in known_sources:
+            raise ValueError(f"Unsupported source selection: {selected}")
+        return selected, selected, ""
+
+    custom = str(custom_source).strip()
+    if not custom:
+        raise ValueError("Source cannot be empty")
+    if custom in known_sources:
+        return custom, custom, ""
+    return custom, CUSTOM_GUI_SOURCE_OPTION, custom
+
+
 def default_gui_artifact_dir(imgsz: int = DEFAULT_GUI_IMGSZ) -> Path:
     return _repo_root() / "outputs" / "artifacts" / f"camera_gui_{int(imgsz)}"
+
+
+def _display_model_name(model_name: str | Path | None, model_path: str | Path | None = None) -> str:
+    candidate = str(model_name or model_path or "").strip()
+    if not candidate:
+        return ""
+    name = Path(candidate).name
+    stem = Path(name).stem
+    return stem or name
 
 
 def _bundle_ready(artifact_dir: Path) -> bool:
@@ -129,33 +192,21 @@ def load_or_build_gui_engine(
     return YOLOEEngine.from_engine(resolved_artifact_dir, device=device)
 
 
-def _overlay_gui_text(
-    frame,
-    source_spec: str,
-    labels: list[str],
-    confidence: float,
-    result,
-    *,
-    tracking_enabled: bool,
-    tracker_name: str,
-) -> None:
-    lines = [
-        f"source: {source_spec}",
-        f"labels: {', '.join(labels)}",
-        f"conf: {confidence:.2f}",
-        f"tracking: {'on' if tracking_enabled else 'off'} ({tracker_name})",
-        "controls: edit source/labels on the left, close window to quit",
-    ]
-    if (
-        tracking_enabled
-        and result.boxes is not None
-        and getattr(result.boxes, "is_track", False)
-        and result.boxes.id is not None
-    ):
-        track_count = int(result.boxes.id.numel()) if hasattr(result.boxes.id, "numel") else int(len(result.boxes.id))
-        lines.append(f"tracks: {track_count}")
+def _compact_overlay_source(source_spec: str, max_chars: int = 44) -> str:
+    source = str(source_spec).strip()
+    if len(source) <= max_chars:
+        return source
+    suffix_chars = min(16, max_chars // 3)
+    prefix_chars = max_chars - suffix_chars - 3
+    return f"{source[:prefix_chars]}...{source[-suffix_chars:]}"
+
+
+def _overlay_gui_text(frame, source_spec: str, result) -> None:
+    lines = [f"source: {_compact_overlay_source(source_spec)}"]
     if getattr(result, "speed", None):
-        lines.append("speed ms: pre={preprocess:.1f} inf={inference:.1f} post={postprocess:.1f}".format(**result.speed))
+        inference_ms = float(result.speed.get("inference", 0.0))
+        if inference_ms > 0.0:
+            lines.append(f"inf fps: {1000.0 / inference_ms:.1f}")
 
     y = 30
     for line in lines:
@@ -169,6 +220,8 @@ class CameraGuiWindow:
         self,
         title: str,
         source_spec: str,
+        source_options: Sequence[str],
+        model_name: str,
         labels: list[str],
         confidence: float,
         tracking_enabled: bool,
@@ -179,16 +232,25 @@ class CameraGuiWindow:
         self._root.resizable(True, True)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._source_var = tk.StringVar(value=source_spec)
+        self._source_options = tuple(source_options)
+        selected_source, custom_source = split_gui_source_selection(source_spec, self._source_options)
+        self._source_selection_var = tk.StringVar(value=selected_source)
+        self._custom_source_var = tk.StringVar(value=custom_source)
         self._label_input_var = tk.StringVar(value="")
         self._confidence_var = tk.DoubleVar(value=float(confidence))
         self._confidence_text_var = tk.StringVar(value=f"{float(confidence):.2f}")
         self._tracking_enabled_var = tk.BooleanVar(value=bool(tracking_enabled))
         self._tracker_var = tk.StringVar(value=normalize_tracker_name(tracker_name))
-        self._status_var = tk.StringVar(value="Edit the source and labels, then press Apply")
+        self._status_var = tk.StringVar(value="Source, labels, confidence, and tracking update live")
+        self._active_source_var = tk.StringVar(value=source_spec)
+        self._active_model_var = tk.StringVar(value=model_name)
+        self._active_labels_var = tk.StringVar(value=", ".join(labels))
+        self._active_confidence_var = tk.StringVar(value=f"{float(confidence):.2f}")
+        self._active_tracker_var = tk.StringVar(value=normalize_tracker_name(tracker_name))
         self._pending_update: tuple[str, list[str], bool, str] | None = None
         self._closed = False
         self._photo: ImageTk.PhotoImage | None = None
+        self._label_states: list[tuple[str, object]] = []
 
         root_frame = tk.Frame(self._root, padx=12, pady=12)
         root_frame.pack(fill="both", expand=True)
@@ -200,36 +262,78 @@ class CameraGuiWindow:
         controls.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
         controls.columnconfigure(0, weight=1)
 
-        tk.Label(controls, text="Camera Source").grid(row=0, column=0, sticky="w")
-        source_entry = tk.Entry(controls, textvariable=self._source_var, width=48)
-        source_entry.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        source_entry.bind("<Return>", lambda _event: self._apply())
+        tk.Label(controls, text="Source").grid(row=0, column=0, sticky="w")
+        source_menu = tk.OptionMenu(
+            controls,
+            self._source_selection_var,
+            *self._source_options,
+            command=lambda _value: self._on_source_selection_change(),
+        )
+        source_menu.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
-        tk.Label(controls, text="Current Labels").grid(row=2, column=0, sticky="w")
-        self._labels_list = tk.Listbox(controls, selectmode="extended", exportselection=False, height=8, width=32)
-        self._labels_list.grid(row=3, column=0, sticky="ew")
+        self._custom_source_label = tk.Label(controls, text="Custom Source")
+        self._custom_source_row = tk.Frame(controls)
+        self._custom_source_row.columnconfigure(0, weight=1)
+        self._custom_source_entry = tk.Entry(self._custom_source_row, textvariable=self._custom_source_var, width=40)
+        self._custom_source_entry.grid(row=0, column=0, sticky="ew")
+        self._custom_source_entry.bind("<Return>", lambda _event: self._apply_custom_source())
+        self._custom_source_apply_button = tk.Button(
+            self._custom_source_row,
+            text="Apply",
+            command=self._apply_custom_source,
+        )
+        self._custom_source_apply_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._custom_source_label.grid(row=2, column=0, sticky="w")
+        self._custom_source_row.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self._update_custom_source_visibility()
+
+        tk.Label(controls, text="Current Labels").grid(row=4, column=0, sticky="w")
+        self._labels_container = tk.Frame(controls, borderwidth=1, relief="sunken")
+        self._labels_container.grid(row=5, column=0, sticky="ew")
+        self._labels_container.rowconfigure(0, weight=1)
+        self._labels_container.columnconfigure(0, weight=1)
+        self._labels_canvas = tk.Canvas(
+            self._labels_container,
+            borderwidth=0,
+            highlightthickness=0,
+            height=DEFAULT_GUI_LABELS_VIEWPORT_HEIGHT,
+        )
+        self._labels_canvas.grid(row=0, column=0, sticky="nsew")
+        self._labels_scrollbar = tk.Scrollbar(
+            self._labels_container,
+            orient="vertical",
+            command=self._labels_canvas.yview,
+        )
+        self._labels_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._labels_scrollbar.grid_remove()
+        self._labels_canvas.configure(yscrollcommand=self._labels_scrollbar.set)
+        self._labels_frame = tk.Frame(self._labels_canvas)
+        self._labels_frame.columnconfigure(0, weight=1)
+        self._labels_window_id = self._labels_canvas.create_window((0, 0), window=self._labels_frame, anchor="nw")
+        self._labels_frame.bind("<Configure>", self._on_labels_frame_configure)
+        self._labels_canvas.bind("<Configure>", self._on_labels_canvas_configure)
+        self._bind_labels_mousewheel(self._labels_container)
+        self._bind_labels_mousewheel(self._labels_canvas)
+        self._bind_labels_mousewheel(self._labels_frame)
+        self._bind_labels_mousewheel(self._labels_scrollbar)
         self._set_label_list(labels)
 
         label_buttons = tk.Frame(controls)
-        label_buttons.grid(row=4, column=0, sticky="ew", pady=(8, 10))
+        label_buttons.grid(row=6, column=0, sticky="ew", pady=(8, 10))
         label_buttons.columnconfigure(0, weight=1)
-        label_buttons.columnconfigure(1, weight=1)
-        label_buttons.columnconfigure(2, weight=1)
 
         tk.Button(label_buttons, text="Remove Selected", command=self._remove_selected_labels).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
+            row=0, column=0, sticky="ew"
         )
-        tk.Button(label_buttons, text="Clear", command=self._clear_labels).grid(row=0, column=1, sticky="ew", padx=4)
-        tk.Button(label_buttons, text="Apply", command=self._apply).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
-        tk.Label(controls, text="Add Label(s)").grid(row=5, column=0, sticky="w")
+        tk.Label(controls, text="Add Label(s)").grid(row=7, column=0, sticky="w")
         label_entry = tk.Entry(controls, textvariable=self._label_input_var, width=48)
-        label_entry.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+        label_entry.grid(row=8, column=0, sticky="ew", pady=(0, 8))
         label_entry.bind("<Return>", lambda _event: self._add_labels_from_input())
 
-        tk.Button(controls, text="Add", command=self._add_labels_from_input).grid(row=7, column=0, sticky="ew")
+        tk.Button(controls, text="Add", command=self._add_labels_from_input).grid(row=9, column=0, sticky="ew")
 
-        tk.Label(controls, text="Confidence Threshold").grid(row=8, column=0, sticky="w")
+        tk.Label(controls, text="Confidence Threshold").grid(row=10, column=0, sticky="w")
         confidence_scale = tk.Scale(
             controls,
             variable=self._confidence_var,
@@ -241,10 +345,10 @@ class CameraGuiWindow:
             showvalue=False,
             command=self._on_confidence_change,
         )
-        confidence_scale.grid(row=9, column=0, sticky="ew", pady=(0, 2))
+        confidence_scale.grid(row=11, column=0, sticky="ew", pady=(0, 2))
 
         confidence_row = tk.Frame(controls)
-        confidence_row.grid(row=10, column=0, sticky="ew", pady=(0, 8))
+        confidence_row.grid(row=12, column=0, sticky="ew", pady=(0, 8))
         confidence_row.columnconfigure(0, weight=1)
         confidence_row.columnconfigure(1, weight=0)
 
@@ -256,26 +360,81 @@ class CameraGuiWindow:
         )
 
         tracking_row = tk.Frame(controls)
-        tracking_row.grid(row=11, column=0, sticky="ew", pady=(8, 4))
+        tracking_row.grid(row=13, column=0, sticky="ew", pady=(8, 4))
         tracking_row.columnconfigure(0, weight=1)
         tracking_row.columnconfigure(1, weight=1)
-        tk.Checkbutton(tracking_row, text="Enable Tracking", variable=self._tracking_enabled_var).grid(
-            row=0, column=0, sticky="w"
-        )
-        tk.OptionMenu(tracking_row, self._tracker_var, *AVAILABLE_TRACKERS).grid(row=0, column=1, sticky="ew")
+        tk.Checkbutton(
+            tracking_row,
+            text="Enable Tracking",
+            variable=self._tracking_enabled_var,
+            command=self._on_tracking_toggle,
+        ).grid(row=0, column=0, sticky="w")
+        tk.OptionMenu(
+            tracking_row,
+            self._tracker_var,
+            *AVAILABLE_TRACKERS,
+            command=lambda _value: self._on_tracker_change(),
+        ).grid(row=0, column=1, sticky="ew")
 
         tk.Label(
             controls,
             text="Use commas or new lines to add multiple labels at once.",
             anchor="w",
             justify="left",
-        ).grid(row=12, column=0, sticky="ew", pady=(8, 0))
+        ).grid(row=14, column=0, sticky="ew", pady=(8, 0))
         tk.Label(controls, textvariable=self._status_var, anchor="w", justify="left", wraplength=320).grid(
-            row=13, column=0, sticky="ew", pady=(8, 0)
+            row=15, column=0, sticky="ew", pady=(8, 0)
         )
 
-        self._video_label = tk.Label(root_frame, text="Waiting for frames...", anchor="center")
-        self._video_label.grid(row=0, column=1, sticky="nsew")
+        display = tk.Frame(root_frame)
+        display.grid(row=0, column=1, sticky="nsew")
+        display.columnconfigure(0, weight=1)
+        display.rowconfigure(0, weight=1)
+
+        self._video_label = tk.Label(display, text="Waiting for frames...", anchor="center")
+        self._video_label.grid(row=0, column=0, sticky="nsew")
+
+        applied = tk.LabelFrame(display, text="Applied Settings", padx=10, pady=8)
+        applied.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        applied.columnconfigure(1, weight=1)
+        applied.columnconfigure(3, weight=1)
+
+        tk.Label(applied, text="Source").grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        tk.Label(
+            applied,
+            textvariable=self._active_source_var,
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        ).grid(row=0, column=1, sticky="ew")
+        self._tracker_label_widget = tk.Label(applied, text="Tracker")
+        self._tracker_label_widget.grid(row=0, column=2, sticky="nw", padx=(16, 8))
+        self._tracker_value_widget = tk.Label(
+            applied, textvariable=self._active_tracker_var, anchor="w", justify="left"
+        )
+        self._tracker_value_widget.grid(row=0, column=3, sticky="ew")
+
+        tk.Label(applied, text="Model").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=(4, 0))
+        tk.Label(
+            applied,
+            textvariable=self._active_model_var,
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        ).grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        tk.Label(applied, text="Confidence").grid(row=1, column=2, sticky="nw", padx=(16, 8), pady=(4, 0))
+        tk.Label(applied, textvariable=self._active_confidence_var, anchor="w", justify="left").grid(
+            row=1, column=3, sticky="ew", pady=(4, 0)
+        )
+        tk.Label(applied, text="Labels").grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=(4, 0))
+        tk.Label(
+            applied,
+            textvariable=self._active_labels_var,
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        ).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(4, 0))
+        self._update_tracker_visibility(bool(tracking_enabled))
 
     @property
     def is_open(self) -> bool:
@@ -288,13 +447,189 @@ class CameraGuiWindow:
         except tk.TclError:
             pass
 
+    def _make_label_state(self, selected: bool = False):
+        labels_frame = getattr(self, "_labels_frame", None)
+        if labels_frame is not None and hasattr(labels_frame, "winfo_exists"):
+            return tk.BooleanVar(master=self._root, value=bool(selected))
+
+        class _BoolState:
+            def __init__(self, value: bool) -> None:
+                self._value = bool(value)
+
+            def get(self) -> bool:
+                return self._value
+
+            def set(self, value: bool) -> None:
+                self._value = bool(value)
+
+        return _BoolState(selected)
+
+    def _on_labels_frame_configure(self, _event=None) -> None:
+        labels_canvas = getattr(self, "_labels_canvas", None)
+        labels_frame = getattr(self, "_labels_frame", None)
+        if labels_canvas is None or labels_frame is None:
+            return
+        try:
+            labels_canvas.configure(scrollregion=labels_canvas.bbox("all"))
+        except tk.TclError:
+            return
+        self._update_labels_scrollbar_visibility()
+
+    def _on_labels_canvas_configure(self, event) -> None:
+        labels_canvas = getattr(self, "_labels_canvas", None)
+        labels_window_id = getattr(self, "_labels_window_id", None)
+        if labels_canvas is None or labels_window_id is None:
+            return
+        try:
+            labels_canvas.itemconfigure(labels_window_id, width=event.width)
+        except tk.TclError:
+            return
+        self._update_labels_scrollbar_visibility()
+
+    def _update_labels_scrollbar_visibility(self) -> None:
+        labels_canvas = getattr(self, "_labels_canvas", None)
+        labels_scrollbar = getattr(self, "_labels_scrollbar", None)
+        if labels_canvas is None or labels_scrollbar is None:
+            return
+        try:
+            bbox = labels_canvas.bbox("all")
+            if bbox is None:
+                labels_scrollbar.grid_remove()
+                return
+            viewport_height = int(labels_canvas.winfo_height())
+        except tk.TclError:
+            return
+        content_height = int(bbox[3] - bbox[1])
+        if content_height > max(viewport_height, 1):
+            labels_scrollbar.grid()
+        else:
+            try:
+                labels_canvas.yview_moveto(0.0)
+            except tk.TclError:
+                return
+            labels_scrollbar.grid_remove()
+
+    def _labels_can_scroll(self) -> bool:
+        labels_canvas = getattr(self, "_labels_canvas", None)
+        if labels_canvas is None:
+            return False
+        try:
+            bbox = labels_canvas.bbox("all")
+            if bbox is None:
+                return False
+            viewport_height = int(labels_canvas.winfo_height())
+        except tk.TclError:
+            return False
+        return int(bbox[3] - bbox[1]) > max(viewport_height, 1)
+
+    def _bind_labels_mousewheel(self, widget) -> None:
+        if widget is None or not hasattr(widget, "bind"):
+            return
+        widget.bind("<MouseWheel>", self._on_labels_mousewheel, add="+")
+        widget.bind("<Button-4>", self._on_labels_mousewheel, add="+")
+        widget.bind("<Button-5>", self._on_labels_mousewheel, add="+")
+
+    def _on_labels_mousewheel(self, event) -> str | None:
+        labels_canvas = getattr(self, "_labels_canvas", None)
+        if labels_canvas is None or not self._labels_can_scroll():
+            return None
+
+        step = 0
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta != 0:
+            step = -1 if delta > 0 else 1
+        else:
+            event_num = int(getattr(event, "num", 0) or 0)
+            if event_num == 4:
+                step = -1
+            elif event_num == 5:
+                step = 1
+        if step == 0:
+            return None
+
+        try:
+            labels_canvas.yview_scroll(step, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
     def _set_label_list(self, labels: Iterable[str]) -> None:
-        self._labels_list.delete(0, tk.END)
-        for label in labels:
-            self._labels_list.insert(tk.END, label)
+        labels_list = [str(label) for label in labels]
+        labels_frame = getattr(self, "_labels_frame", None)
+        existing_states = {label: bool(state.get()) for label, state in getattr(self, "_label_states", [])}
+        self._label_states = []
+
+        if labels_frame is not None and hasattr(labels_frame, "winfo_children"):
+            for child in labels_frame.winfo_children():
+                try:
+                    child.destroy()
+                except tk.TclError:
+                    pass
+
+            for row_index, label in enumerate(labels_list):
+                state = self._make_label_state(existing_states.get(label, False))
+                checkbox = tk.Checkbutton(labels_frame, text=label, variable=state, anchor="w", justify="left")
+                checkbox.grid(row=row_index, column=0, sticky="ew")
+                self._bind_labels_mousewheel(checkbox)
+                self._label_states.append((label, state))
+            self._on_labels_frame_configure()
+            return
+
+        for label in labels_list:
+            state = self._make_label_state(existing_states.get(label, False))
+            self._label_states.append((label, state))
+
+    def _update_tracker_visibility(self, tracking_enabled: bool) -> None:
+        if tracking_enabled:
+            self._tracker_label_widget.grid()
+            self._tracker_value_widget.grid()
+        else:
+            self._tracker_label_widget.grid_remove()
+            self._tracker_value_widget.grid_remove()
+
+    def _update_custom_source_visibility(self) -> None:
+        if self._source_selection_var.get() == CUSTOM_GUI_SOURCE_OPTION:
+            self._custom_source_label.grid()
+            self._custom_source_row.grid()
+        else:
+            self._custom_source_label.grid_remove()
+            self._custom_source_row.grid_remove()
+
+    def _queue_current_update(self, *, source_override: str | None = None, status_message: str | None = None) -> bool:
+        labels = self._current_labels()
+        if not labels:
+            self._status_var.set("Add at least one label before applying")
+            return False
+        source = str(source_override if source_override is not None else self._active_source_var.get()).strip()
+        if not source:
+            self._status_var.set("Source cannot be empty")
+            return False
+        self._pending_update = (
+            source,
+            labels,
+            bool(self._tracking_enabled_var.get()),
+            normalize_tracker_name(self._tracker_var.get()),
+        )
+        if status_message:
+            self._status_var.set(status_message)
+        return True
+
+    def _on_source_selection_change(self) -> None:
+        self._update_custom_source_visibility()
+        selected_source = self._source_selection_var.get()
+        if selected_source == CUSTOM_GUI_SOURCE_OPTION:
+            self._status_var.set("Enter a custom source and press Apply")
+            return
+        self._queue_current_update(
+            source_override=selected_source,
+            status_message=f"Switching source to '{selected_source}'...",
+        )
 
     def _current_labels(self) -> list[str]:
-        return [str(item) for item in self._labels_list.get(0, tk.END)]
+        return [label for label, _state in self._label_states]
+
+    def _selected_labels(self) -> list[str]:
+        return [label for label, state in self._label_states if bool(state.get())]
 
     def _add_labels_from_input(self) -> None:
         new_labels = parse_label_text(self._label_input_var.get())
@@ -313,50 +648,57 @@ class CameraGuiWindow:
         if added == 0:
             self._status_var.set("Those labels are already in the list")
         else:
-            self._status_var.set(f"Added {added} label(s); press Apply to activate them")
+            self._queue_current_update(status_message=f"Applying {added} added label(s)...")
 
     def _remove_selected_labels(self) -> None:
-        selected = list(self._labels_list.curselection())
+        selected = self._selected_labels()
         if not selected:
             self._status_var.set("Select one or more labels to remove")
             return
 
         labels = self._current_labels()
-        for index in reversed(selected):
-            del labels[index]
-        self._set_label_list(labels)
-        self._status_var.set("Removed selected label(s); press Apply to activate the change")
+        if len(selected) >= len(labels):
+            self._status_var.set("At least one label must remain active")
+            return
+        selected_labels = set(selected)
+        self._set_label_list([label for label in labels if label not in selected_labels])
+        self._queue_current_update(status_message="Applying removed label(s)...")
 
-    def _clear_labels(self) -> None:
-        self._set_label_list([])
-        self._status_var.set("Cleared staged labels; add at least one label before applying")
+    def _apply_custom_source(self) -> None:
+        try:
+            source, selected_source, custom_source = resolve_gui_source_selection(
+                self._source_selection_var.get(),
+                self._custom_source_var.get(),
+                self._source_options,
+            )
+        except ValueError as exc:
+            self._status_var.set(str(exc))
+            return
+        self._source_selection_var.set(selected_source)
+        self._custom_source_var.set(custom_source)
+        self._update_custom_source_visibility()
+        self._queue_current_update(
+            source_override=source,
+            status_message=f"Switching source to '{source}'...",
+        )
 
     def _on_confidence_change(self, value: str) -> None:
         confidence = parse_confidence_text(value, fallback=float(DEFAULT_GUI_CONF))
         self._confidence_text_var.set(f"{confidence:.2f}")
+        self._active_confidence_var.set(f"{confidence:.2f}")
 
     def _apply_confidence_text(self) -> None:
         confidence = parse_confidence_text(self._confidence_text_var.get(), fallback=float(DEFAULT_GUI_CONF))
         self._confidence_var.set(confidence)
         self._confidence_text_var.set(f"{confidence:.2f}")
+        self._active_confidence_var.set(f"{confidence:.2f}")
         self._status_var.set(f"Confidence threshold set to {confidence:.2f}; it applies on the next frame")
 
-    def _apply(self) -> None:
-        source = self._source_var.get().strip()
-        labels = self._current_labels()
-        if not source:
-            self._status_var.set("Source cannot be empty")
-            return
-        if not labels:
-            self._status_var.set("Add at least one label before applying")
-            return
-        self._pending_update = (
-            source,
-            labels,
-            bool(self._tracking_enabled_var.get()),
-            normalize_tracker_name(self._tracker_var.get()),
-        )
-        self._status_var.set("Queued source/label/tracker update; confidence changes already apply live")
+    def _on_tracking_toggle(self) -> None:
+        self._queue_current_update(status_message="Applying tracking setting...")
+
+    def _on_tracker_change(self) -> None:
+        self._queue_current_update(status_message="Applying tracker backend...")
 
     def pump(self) -> None:
         if self._closed:
@@ -392,23 +734,42 @@ class CameraGuiWindow:
         tracker_name: str,
         message: str | None = None,
     ) -> None:
-        self._source_var.set(source)
+        preserve_custom_staging = (
+            self._source_selection_var.get() == CUSTOM_GUI_SOURCE_OPTION
+            and bool(str(self._custom_source_var.get()).strip())
+            and str(source).strip() == str(self._active_source_var.get()).strip()
+        )
+        if not preserve_custom_staging:
+            selected_source, custom_source = split_gui_source_selection(source, self._source_options)
+            self._source_selection_var.set(selected_source)
+            self._custom_source_var.set(custom_source)
+            self._update_custom_source_visibility()
         self._set_label_list(labels)
         self._tracking_enabled_var.set(bool(tracking_enabled))
         self._tracker_var.set(normalize_tracker_name(tracker_name))
-        self._status_var.set(
-            message
-            or (
-                f"Active source updated; labels={', '.join(labels)} conf={self.confidence():.2f} "
-                f"tracking={'on' if tracking_enabled else 'off'} backend={tracker_name}"
-            )
-        )
+        self._active_source_var.set(source)
+        self._active_labels_var.set(", ".join(labels))
+        self._active_confidence_var.set(f"{self.confidence():.2f}")
+        self._active_tracker_var.set(normalize_tracker_name(tracker_name))
+        self._update_tracker_visibility(bool(tracking_enabled))
+        self._status_var.set(message or "Settings applied")
 
-    def show_frame(self, frame_bgr) -> None:
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(frame_rgb)
-        self._photo = ImageTk.PhotoImage(image=image, master=self._root)
-        self._video_label.configure(image=self._photo, text="")
+    def show_frame(self, frame_bgr) -> bool:
+        if self._closed:
+            return False
+        try:
+            if not bool(self._root.winfo_exists()) or not bool(self._video_label.winfo_exists()):
+                self._closed = True
+                return False
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame_rgb)
+            self._photo = ImageTk.PhotoImage(image=image, master=self._root)
+            self._video_label.configure(image=self._photo, text="")
+            return True
+        except tk.TclError:
+            self._closed = True
+            self._photo = None
+            return False
 
     def close(self) -> None:
         self._on_close()
@@ -439,6 +800,10 @@ def run_camera_gui(
 ) -> int:
     target_size = normalize_imgsz(imgsz or engine.metadata.default_imgsz)
     resolved_max_det = int(max_det or engine.metadata.max_det)
+    model_name = _display_model_name(
+        getattr(engine.metadata, "model_name", ""),
+        getattr(engine.metadata, "model_path", ""),
+    )
     active_source_spec = str(source_spec)
     active_labels = list(labels)
     active_tracking = bool(tracking)
@@ -457,15 +822,23 @@ def run_camera_gui(
                 timeout_s=timeout_s,
                 prefix=prefix,
                 max_frames=max_frames,
+                zero_copy=None,
+                preview_cpu=True,
+                target_imgsz=target_size,
+                fp16=engine._main_fp16,
+                device=engine.device,
             )
 
         make_source = _make_source
 
     engine.clear_prompts()
     engine.set_classes(active_labels)
+    source_options = discover_gui_camera_sources()
     gui_window = CameraGuiWindow(
         window_title,
         active_source_spec,
+        source_options,
+        model_name,
         active_labels,
         confidence=conf,
         tracking_enabled=active_tracking,
@@ -506,16 +879,13 @@ def run_camera_gui(
             except Exception as exc:
                 LOGGER.warning("Unable to switch GUI source to '%s': %s", new_source_spec, exc)
                 message = f"Unable to open source '{new_source_spec}': {exc}"
-                if labels_changed:
-                    gui_window.mark_applied(
-                        active_source_spec,
-                        active_labels,
-                        active_tracking,
-                        active_tracker,
-                        message=f"Applied labels; {message}",
-                    )
-                else:
-                    gui_window.set_status(message)
+                gui_window.mark_applied(
+                    active_source_spec,
+                    active_labels,
+                    active_tracking,
+                    active_tracker,
+                    message=f"Applied labels; {message}" if labels_changed else message,
+                )
                 return False
 
             active_source_spec = new_source_spec
@@ -589,16 +959,9 @@ def run_camera_gui(
                     if on_result is not None:
                         on_result(result, active_source_spec, list(active_labels))
                     frame = result.plot(color_mode="instance" if tracker_session is not None else "class")
-                    _overlay_gui_text(
-                        frame,
-                        active_source_spec,
-                        active_labels,
-                        active_conf,
-                        result,
-                        tracking_enabled=tracker_session is not None,
-                        tracker_name=active_tracker,
-                    )
-                    gui_window.show_frame(frame)
+                    _overlay_gui_text(frame, active_source_spec, result)
+                    if not gui_window.show_frame(frame):
+                        break
                     displayed_frames += 1
 
                     if wait_ms > 0:
@@ -618,7 +981,12 @@ def run_camera_gui(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch the YOLOE TensorRT live camera GUI.")
-    parser.add_argument("--source", default=DEFAULT_GUI_SOURCE, help="Initial camera source. Defaults to /dev/video0.")
+    parser.add_argument(
+        "--source",
+        default=DEFAULT_GUI_SOURCE,
+        help="Initial camera source. Accepts /dev/video*, rtsp://..., videotest://..., or a raw GStreamer pipeline. "
+        "Defaults to /dev/video0.",
+    )
     parser.add_argument(
         "--label",
         action="append",

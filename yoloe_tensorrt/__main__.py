@@ -18,6 +18,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     export_parser = subparsers.add_parser("export", help="Export a YOLOE checkpoint into an artifact bundle.")
     export_parser.set_defaults(handler="export")
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark runtime performance.")
+    benchmark_parser.set_defaults(handler="benchmark")
     return parser
 
 
@@ -31,6 +34,10 @@ def main(argv: list[str] | None = None) -> int:
         from .export_cli import main as export_main
 
         return export_main(argv[1:])
+    if argv[:1] == ["benchmark"]:
+        from .benchmark_cli import main as benchmark_main
+
+        return benchmark_main(argv[1:])
 
     parser = build_arg_parser()
     parser.parse_args(argv)

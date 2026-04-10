@@ -4,13 +4,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import yaml
 from ultralytics.engine.results import Results
 from ultralytics.utils import IterableSimpleNamespace
 
+from .inputs import InferenceSourceItem, PreparedTensorInput, normalize_single_inference_source
 from .logging_utils import get_logger
-from .source import SourceItem, normalize_source
+from .source import SourceItem
 
 if TYPE_CHECKING:
     from .engine import YOLOEEngine
@@ -115,7 +117,10 @@ def _apply_tracking_to_result(result: Results, tracker_backend) -> Results:
     if len(tracks) == 0:
         return result
 
-    keep_indices = tracks[:, -1].astype(int).tolist()
+    keep_indices_np = tracks[:, -1].astype(np.int64, copy=False)
+    keep_indices = keep_indices_np
+    if torch.is_tensor(result.boxes.data) and result.boxes.data.device.type != "cpu":
+        keep_indices = torch.as_tensor(keep_indices_np, device=result.boxes.data.device)
     tracked_result = result[keep_indices]
     dtype = result.boxes.data.dtype if torch.is_tensor(result.boxes.data) else torch.float32
     tracked_boxes = torch.as_tensor(tracks[:, :-1], dtype=dtype)
@@ -175,25 +180,67 @@ class YOLOETrackerSession:
 
     def update(
         self,
-        frame: SourceItem | object,
+        frame: InferenceSourceItem | object,
         source_key: str | None = None,
         imgsz: int | tuple[int, int] | list[int] | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
         retina_masks: bool = False,
+        cuda: bool | None = None,
+        input_hint: str | None = None,
+        original_image: SourceItem | object | None = None,
+        path: str | None = None,
     ) -> Results:
         self._reset_if_needed(source_key)
-        if isinstance(frame, SourceItem):
-            item = frame
-        else:
-            item = normalize_source(frame, default_prefix="frame")[0]
-        result = self.engine.predict_item(
+        resolved_max_det = int(max_det or self.engine.metadata.max_det)
+        item = normalize_single_inference_source(
+            frame,
+            default_prefix="frame",
+            input_hint=input_hint,
+            cuda=cuda,
+            original_image=original_image,
+            path=path,
+            multiple_error="YOLOETrackerSession.update expects a single frame input",
+        )
+        result = self.engine._predict_input_entry(
             item=item,
             imgsz=imgsz,
             conf=conf,
             iou=iou,
-            max_det=max_det,
+            max_det=resolved_max_det,
             retina_masks=retina_masks,
         )
         return _apply_tracking_to_result(result, self._backend)
+
+    def update_cuda(
+        self,
+        tensor: torch.Tensor | object,
+        *,
+        original_image: SourceItem | object | None = None,
+        path: str | None = None,
+        source_key: str | None = None,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int | None = None,
+        retina_masks: bool = False,
+    ) -> Results:
+        prepared = (
+            tensor
+            if isinstance(tensor, PreparedTensorInput)
+            else PreparedTensorInput(
+                tensor=tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor),
+                path=path or "tensor0",
+                original_image=original_image,
+            )
+        )
+        return self.update(
+            prepared,
+            source_key=source_key,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            retina_masks=retina_masks,
+            cuda=True,
+            input_hint="prepared",
+        )

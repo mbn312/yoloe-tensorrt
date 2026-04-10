@@ -5,9 +5,12 @@
 ## Highlights
 
 - Runtime text labels without rebuilding the main TensorRT engine
-- Optional visual prompts for YOLOE detection and segmentation models
+- Native visual-prompt TensorRT execution for YOLOE detection and segmentation models
 - Stateful object tracking with ByteTrack or BoT-SORT on top of YOLOE results
-- Native C++ TensorRT main-engine runtime with GPU output handoff back to Python
+- Native C++ TensorRT main-engine runtime with CUDA preprocess, native postprocess, and GPU output handoff back to Python
+- Unified `predict(...)` and `track(...)` APIs with a prepared-tensor fast path
+- RTSP, USB camera, and Jetson zero-copy NVMM/EGL/CUDA camera ingest support
+- Structured benchmark CLI for runtime paths, prompt updates, CPU use, allocations, and regression comparison
 - Python package API, export CLI, and live camera GUI
 - Jetson-first deployment model with Linux x86_64 CUDA/TensorRT also supported
 
@@ -118,6 +121,29 @@ results = engine.predict("tests/assets/images/bus.jpg")
 print(results[0].boxes.data.shape[0], results[0].names)
 ```
 
+Run the lowest-overhead headless path through the unified API:
+
+```python
+from yoloe_tensorrt import YOLOEEngine
+
+engine = YOLOEEngine.from_engine("outputs/artifacts/yoloe26s")
+engine.set_classes(["bus"])
+prepared = engine.prepare_cuda_input("tests/assets/images/bus.jpg")
+result = engine.predict(prepared)[0]
+print(result.boxes.data.shape[0], result.speed)
+```
+
+If you already have a model-ready tensor, route it through the same API explicitly:
+
+```python
+result = engine.predict(
+    your_tensor,
+    input_hint="prepared",
+    original_image="tests/assets/images/bus.jpg",
+    path="bus.jpg",
+)[0]
+```
+
 Track objects across frames:
 
 ```python
@@ -141,18 +167,41 @@ Launch the GUI against a synthetic GStreamer source when no camera is attached:
 yoloe-camera-gui --source videotest://ball
 ```
 
+Launch the GUI against an RTSP stream:
+
+```bash
+yoloe-camera-gui --source rtsp://user:pass@camera.local:554/stream
+```
+
 Repo-local convenience launcher:
 
 ```bash
 scripts/launch_camera_gui.sh
 ```
 
+Benchmark host-image vs CUDA-tensor paths:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode both --runs 200 --warmup 20
+```
+
+Benchmark a Jetson camera source and save structured results under `outputs/benchmarks/`:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode camera --camera-source /dev/video0 --camera-zero-copy auto
+```
+
+See [Benchmarks](docs/benchmarks.md) for the full runtime matrix covering CPU-memory input, CUDA-tensor input, Jetson
+zero-copy camera input, text-prompt update cost, and visual-prompt update cost.
+
 ## CI/CD
 
 GitHub Actions is the supported automation path for this repository.
 
 - CI runs Ruff, runner-safe unit tests, docs validation, source-distribution builds, and clean install smoke tests.
-- Tag pushes like `v0.1.0` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
+- Tag pushes like `v0.2.0` run a release scaffold that verifies `pyproject.toml` and `CHANGELOG.md`, then uploads release artifacts without publishing them.
 - GPU and Jetson-specific validation are intentionally not part of required public CI yet.
 
 ## Model Assets and Caching
@@ -166,10 +215,18 @@ GitHub Actions is the supported automation path for this repository.
 ## Runtime Notes
 
 - The main inference engine path is native C++/TensorRT.
-- Prompt compilation, visual prompt orchestration, and Ultralytics `Results` wrapping still live in Python.
+- Host-image preprocessing uses native CUDA kernels when the native runtime is built.
+- Main-engine decode, NMS, box rescale, and segmentation mask reconstruction run in the native backend.
+- Visual-prompt TensorRT execution can run through the native backend, with Python still orchestrating prompt setup.
+- Prompt compilation and Ultralytics `Results` wrapping still live in Python.
 - Tracking is stateful and currently runs in Python on top of the detection/segmentation results.
+- `predict(...)` and `track(...)` choose the fastest supported internal path for the input representation they are given.
+- The prepared-tensor fast path is reached by passing the object returned from `prepare_cuda_input(...)` or by using `input_hint="prepared"`.
+- Plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors are still accepted without requiring manual preprocessing.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
-- Live USB camera input is available through a GStreamer appsink pipeline. Jetson zero-copy camera ingest is still on the roadmap.
+- Live camera sources can use a Jetson zero-copy NVMM/EGL/CUDA ingest path when the native camera backend is built and the source negotiates an NVMM pipeline.
+- `camera_source_from_spec(..., target_imgsz=..., zero_copy=None|True|False)` controls that camera ingest policy. `None` auto-selects zero-copy when available, `True` requires it, and `False` forces the fallback CPU appsink path.
+- Direct RTSP URLs such as `rtsp://camera.local/stream` are supported and resolved to a GStreamer RTSP pipeline automatically.
 - If you do not have a camera attached, use `videotest://<pattern>` such as `videotest://ball` or `videotest://smpte`.
 
 ## Repository Layout
@@ -186,18 +243,19 @@ GitHub Actions is the supported automation path for this repository.
 - [Quickstart](docs/quickstart.md)
 - [Export and Artifact Bundles](docs/export.md)
 - [Runtime Prompts](docs/prompts.md)
+- [Benchmarks](docs/benchmarks.md)
 - [Camera GUI](docs/camera-gui.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Development](docs/development.md)
 
 ## Status
 
-The project is usable today for Jetson-focused deployments, but it is still early-stage. The remaining performance roadmap is centered on:
+The project is usable today for Jetson-focused deployments, but it is still early-stage. Version 0.2.0 completes the
+main runtime performance roadmap around CUDA preprocess, native postprocess, native visual prompts, zero-copy camera
+ingest, and benchmark coverage.
 
-- Jetson zero-copy NVMM/EGL/CUDA camera ingest
-- CUDA preprocess instead of CPU/OpenCV preprocess
-- Native decode/NMS/mask reconstruction
-- Native visual-prompt execution
+Remaining work is focused on deployment hardening, target-hardware benchmark baselines, and keeping GPU/Jetson validation
+available outside required public CI.
 
 ## License
 

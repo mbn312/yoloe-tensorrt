@@ -324,9 +324,7 @@ def _export_onnx(
             )
         except Exception as exc:
             _cleanup_partial()
-            raise RuntimeError(
-                "Dynamo ONNX export failed. Retry with exporter='legacy' or exporter='auto'."
-            ) from exc
+            raise RuntimeError("Dynamo ONNX export failed. Retry with exporter='legacy' or exporter='auto'.") from exc
         return path
 
     if _torch_onnx_supports("dynamo"):

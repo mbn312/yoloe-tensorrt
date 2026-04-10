@@ -33,11 +33,13 @@ PYTHONPYCACHEPREFIX=outputs/pycache python -m pytest -q \
   tests/test_assets.py \
   tests/test_cli.py \
   tests/test_gui_helpers.py \
+  tests/test_inputs.py \
   tests/test_logging.py \
   tests/test_prompts.py \
   tests/test_release_metadata.py \
   tests/test_text_encoder_fallback.py \
-  tests/test_export.py
+  tests/test_export.py \
+  tests/test_tracking.py
 ```
 
 ## Integration verification
@@ -52,11 +54,45 @@ python -m pytest -s -o log_cli=true --log-cli-level=INFO \
   tests/test_runtime_integration.py -m integration
 ```
 
+## Performance checks
+
+The public API is unified around `YOLOEEngine.predict(...)` and `YOLOEEngine.track(...)`, but the lowest-overhead headless
+route is still the prepared-tensor path returned by `YOLOEEngine.prepare_cuda_input(...)`. Benchmark host-image vs
+prepared-tensor inference with JSON output under `outputs/benchmarks/`:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode both --runs 200 --warmup 20
+```
+
+Jetson camera-path benchmarks use the same command and consume a finite live-source window of `warmup + runs` frames:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode camera --camera-source /dev/video0 \
+  --camera-zero-copy auto --runs 200 --warmup 20
+```
+
+Each result reports median/p95 latency, FPS, measured-loop process CPU, and measured-loop total system CPU. To compare
+against a saved baseline without failing the command, use:
+
+```bash
+yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
+  --label bus --mode all --camera-source /dev/video0 \
+  --compare-to outputs/benchmarks/<baseline>.json
+```
+
+Add `--fail-on-regression` to make the command exit non-zero when the configured latency, FPS, or CPU thresholds are
+exceeded, or when the comparison is invalid because no modes or no metrics were compared.
+
+The full benchmark matrix, including text-prompt and visual-prompt update costs, is documented in
+[Benchmarks](benchmarks.md).
+
 ## CI and release automation
 
 - Public CI runs Ruff, runner-safe unit tests, docs validation, sdist builds, and clean install smoke tests.
 - Required public CI does not assume CUDA, TensorRT headers, or a self-hosted Jetson runner.
-- Tag pushes like `v0.1.0` trigger the release scaffold, which verifies the version and changelog before uploading source artifacts.
+- Tag pushes like `v0.2.0` trigger the release scaffold, which verifies the version and changelog before uploading source artifacts.
 - GPU and Jetson-specific validation remain a future optional self-hosted workflow.
 
 ## Output conventions

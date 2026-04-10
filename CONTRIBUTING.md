@@ -85,4 +85,4 @@ python -m pytest -s -o log_cli=true --log-cli-level=INFO \
 - Keep changes scoped.
 - Document verification that actually ran.
 - Call out unsupported assumptions, hardware-specific behavior, or missing test coverage.
-- Update `README.md`, `docs/`, and `AGENTS.md` when repo conventions or public entry points change.
+- Update `README.md` and `docs/` when repo conventions or public entry points change.

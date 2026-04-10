@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import torch
 from yoloe_tensorrt import (
-    GStreamerSource,
     YOLOEEngine,
     camera_source_from_spec,
     configure_logging,
@@ -25,7 +24,9 @@ TEST_IMAGES = {
 }
 USB_CAMERA_DEVICE = Path(os.environ.get("YOLOE_TRT_TEST_CAMERA_DEVICE", "/dev/video0"))
 DEFAULT_CAMERA_SOURCE = (
-    os.environ.get("YOLOE_TRT_TEST_CAMERA_SOURCE") or str(USB_CAMERA_DEVICE) if USB_CAMERA_DEVICE.exists() else "videotest://ball"
+    os.environ.get("YOLOE_TRT_TEST_CAMERA_SOURCE") or str(USB_CAMERA_DEVICE)
+    if USB_CAMERA_DEVICE.exists()
+    else "videotest://ball"
 )
 
 
@@ -40,8 +41,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=DEFAULT_CAMERA_SOURCE,
         help="Camera source for live GUI/integration tests. "
         "Defaults to /dev/video0 when present, otherwise videotest://ball. "
-        "Device paths are wrapped in a USB-camera GStreamer pipeline; raw GStreamer pipelines and dummy aliases "
-        "like videotest://ball are also accepted.",
+        "Device paths are wrapped in a USB-camera GStreamer pipeline; RTSP URLs, raw GStreamer pipelines, and "
+        "dummy aliases like videotest://ball are also accepted.",
     )
     group.addoption(
         "--camera-labels",
@@ -127,13 +128,15 @@ def camera_max_frames(pytestconfig: pytest.Config) -> int | None:
 
 
 @pytest.fixture(scope="session")
-def make_camera_source():
+def make_camera_source(integration_imgsz: int):
     width = int(os.environ.get("YOLOE_TRT_TEST_CAMERA_WIDTH", "640"))
     height = int(os.environ.get("YOLOE_TRT_TEST_CAMERA_HEIGHT", "480"))
     fps = int(os.environ.get("YOLOE_TRT_TEST_CAMERA_FPS", "30"))
     timeout_s = float(os.environ.get("YOLOE_TRT_TEST_CAMERA_TIMEOUT", "5.0"))
+    zero_copy = os.environ.get("YOLOE_TRT_TEST_CAMERA_ZERO_COPY", "").lower()
+    zero_copy_value = None if zero_copy == "" else zero_copy not in {"0", "false", "no"}
 
-    def _make(source_value: str, *, prefix: str, max_frames: int | None) -> GStreamerSource:
+    def _make(source_value: str, *, prefix: str, max_frames: int | None):
         try:
             return camera_source_from_spec(
                 source_value,
@@ -143,6 +146,9 @@ def make_camera_source():
                 max_frames=max_frames,
                 timeout_s=timeout_s,
                 prefix=prefix,
+                zero_copy=zero_copy_value,
+                target_imgsz=integration_imgsz,
+                fp16=True,
             )
         except FileNotFoundError as exc:
             pytest.skip(str(exc))
@@ -151,7 +157,7 @@ def make_camera_source():
 
 
 @pytest.fixture(scope="session")
-def usb_camera_source(pytestconfig: pytest.Config, make_camera_source) -> GStreamerSource:
+def usb_camera_source(pytestconfig: pytest.Config, make_camera_source):
     try:
         return make_camera_source(
             str(pytestconfig.getoption("--camera-source")),
