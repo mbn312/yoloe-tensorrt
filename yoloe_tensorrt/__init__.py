@@ -9,6 +9,9 @@ __all__ = [
     "DatasetSplit",
     "DatasetValidationError",
     "export_model",
+    "train_model",
+    "TrainingError",
+    "TrainingResult",
     "validate_dataset_config",
     "configure_logging",
     "GStreamerSource",
@@ -58,6 +61,18 @@ def __getattr__(name: str):
         from .datasets import validate_dataset_config
 
         return validate_dataset_config
+    if name == "train_model":
+        from .training import train_model
+
+        return train_model
+    if name == "TrainingError":
+        from .training import TrainingError
+
+        return TrainingError
+    if name == "TrainingResult":
+        from .training import TrainingResult
+
+        return TrainingResult
     if name == "configure_logging":
         from .logging_utils import configure_logging
 

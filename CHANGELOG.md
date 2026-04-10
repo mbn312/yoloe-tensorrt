@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a package-level `train_model(...)` API for YOLOE training and fine-tuning through Ultralytics.
 - Added YOLOE dataset config validation helpers for Ultralytics-style detection and segmentation training inputs.
 
 ## 0.2.0

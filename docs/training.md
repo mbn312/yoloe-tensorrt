@@ -1,11 +1,51 @@
-# Training Data
+# Training
 
-`yoloe-tensorrt` keeps training and fine-tuning execution delegated to Ultralytics, but it provides a preflight helper for
-checking YOLOE dataset configs before training starts.
+`yoloe-tensorrt` delegates YOLOE training and fine-tuning to Ultralytics while providing a package-level API that
+validates dataset configs before launching a run.
+
+## Train or fine-tune
+
+Use `train_model(...)` when you want the package to validate the dataset and call Ultralytics for you:
+
+```python
+from yoloe_tensorrt import train_model
+
+result = train_model(
+    "yoloe-26s-seg.pt",
+    "data.yaml",
+    task="segment",
+    imgsz=640,
+    epochs=50,
+    batch=8,
+    device="cuda:0",
+)
+
+print(result.checkpoint_path)
+print(result.run_dir)
+```
+
+By default, run outputs are placed under `outputs/training`. The result includes the selected checkpoint path, the
+Ultralytics run directory, an optional metrics file path when one exists, and basic metadata about the run.
+
+Pass advanced Ultralytics trainer options with `overrides`:
+
+```python
+result = train_model(
+    "yoloe-26s-seg.pt",
+    "data.yaml",
+    overrides={"workers": 4, "optimizer": "AdamW", "lr0": 0.001},
+)
+```
+
+Ultralytics keys controlled by the wrapper are reserved in `overrides`. Pass `data` as `dataset_config`, `project` as
+`output_dir`, and use the explicit `task`, `imgsz`, `epochs`, `batch`, `device`, and `name` arguments.
+
+For advanced Ultralytics workflows that need a custom trainer, nonstandard save behavior, or distributed training
+orchestration, call Ultralytics directly.
 
 ## Validate a dataset config
 
-Use `validate_dataset_config(...)` with an Ultralytics-style dataset YAML:
+Use `validate_dataset_config(...)` directly when you only need a preflight check:
 
 ```python
 from yoloe_tensorrt import validate_dataset_config
@@ -15,15 +55,11 @@ print(dataset.names)
 print(dataset.train.image_count, dataset.val.image_count)
 ```
 
-For segmentation datasets, set `task="segment"`:
-
-```python
-dataset = validate_dataset_config("data.yaml", task="segment")
-```
+For segmentation datasets, set `task="segment"`.
 
 ## Supported config shape
 
-The helper supports the standard YOLO dataset fields:
+The training and validation helpers support the standard YOLO dataset fields:
 
 ```yaml
 path: /data/my-dataset
@@ -48,5 +84,4 @@ provided, otherwise against the YAML file directory.
 - Segmentation labels must use `class x1 y1 x2 y2 ...` with at least three polygon points.
 - Label class IDs must be in range and coordinates must be finite normalized values in `[0, 1]`.
 
-Validation does not create generated outputs. If future training helpers write reports or artifacts, they should place
-them under `outputs/`.
+Dataset validation alone does not create generated outputs.

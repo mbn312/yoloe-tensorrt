@@ -25,6 +25,7 @@ the main inference hot path into a native backend.
 - `yoloe-export`
 - `yoloe-camera-gui`
 - `yoloe-benchmark`
+- `train_model(...)`
 - `validate_dataset_config(...)`
 - `python -m yoloe_tensorrt`
 
