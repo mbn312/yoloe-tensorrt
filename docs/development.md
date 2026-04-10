@@ -85,6 +85,9 @@ yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
 Add `--fail-on-regression` to make the command exit non-zero when the configured latency, FPS, or CPU thresholds are
 exceeded, or when the comparison is invalid because no modes or no metrics were compared.
 
+The full benchmark matrix, including text-prompt and visual-prompt update costs, is documented in
+[Benchmarks](benchmarks.md).
+
 ## CI and release automation
 
 - Public CI runs Ruff, runner-safe unit tests, docs validation, sdist builds, and clean install smoke tests.
