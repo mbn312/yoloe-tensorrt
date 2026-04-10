@@ -5,7 +5,11 @@ __all__ = [
     "YOLOEEngine",
     "YOLOETrackerSession",
     "PreparedTensorInput",
+    "DatasetConfig",
+    "DatasetSplit",
+    "DatasetValidationError",
     "export_model",
+    "validate_dataset_config",
     "configure_logging",
     "GStreamerSource",
     "JetsonZeroCopySource",
@@ -38,6 +42,22 @@ def __getattr__(name: str):
         from .tracking import YOLOETrackerSession
 
         return YOLOETrackerSession
+    if name == "DatasetConfig":
+        from .datasets import DatasetConfig
+
+        return DatasetConfig
+    if name == "DatasetSplit":
+        from .datasets import DatasetSplit
+
+        return DatasetSplit
+    if name == "DatasetValidationError":
+        from .datasets import DatasetValidationError
+
+        return DatasetValidationError
+    if name == "validate_dataset_config":
+        from .datasets import validate_dataset_config
+
+        return validate_dataset_config
     if name == "configure_logging":
         from .logging_utils import configure_logging
 

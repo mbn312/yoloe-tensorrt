@@ -25,6 +25,7 @@ def test_export_and_dev_dependencies_include_onnxscript() -> None:
     all_reqs = optional["all"]
 
     assert "lap>=0.5.12" in dependencies
+    assert "PyYAML>=6.0" in dependencies
     assert any(req.startswith("onnx>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in export_reqs)
     assert any(req.startswith("onnxscript>=") for req in dev_reqs)
