@@ -37,6 +37,7 @@ def test_module_entrypoint_displays_help() -> None:
     assert "camera-gui" in result.stdout
     assert "export" in result.stdout
     assert "benchmark" in result.stdout
+    assert "train" in result.stdout
 
 
 def test_export_cli_displays_help() -> None:

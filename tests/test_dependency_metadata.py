@@ -34,6 +34,12 @@ def test_export_and_dev_dependencies_include_onnxscript() -> None:
     assert "mkdocs>=1.6" in all_reqs
 
 
+def test_project_scripts_include_training_cli() -> None:
+    data = _load_pyproject()
+
+    assert data["project"]["scripts"]["yoloe-train"] == "yoloe_tensorrt.train_cli:main"
+
+
 def test_requirements_files_include_clip_dependency() -> None:
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     requirements_dev = (REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")

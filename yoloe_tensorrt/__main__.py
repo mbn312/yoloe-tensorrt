@@ -21,6 +21,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark runtime performance.")
     benchmark_parser.set_defaults(handler="benchmark")
+
+    train_parser = subparsers.add_parser("train", help="Train or fine-tune a YOLOE checkpoint.")
+    train_parser.set_defaults(handler="train")
     return parser
 
 
@@ -38,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
         from .benchmark_cli import main as benchmark_main
 
         return benchmark_main(argv[1:])
+    if argv[:1] == ["train"]:
+        from .train_cli import main as train_main
+
+        return train_main(argv[1:])
 
     parser = build_arg_parser()
     parser.parse_args(argv)
