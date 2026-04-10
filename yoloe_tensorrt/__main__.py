@@ -19,7 +19,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_parser = subparsers.add_parser("export", help="Export a YOLOE checkpoint into an artifact bundle.")
     export_parser.set_defaults(handler="export")
 
-    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark host-image and CUDA-tensor inference.")
+    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark runtime performance.")
     benchmark_parser.set_defaults(handler="benchmark")
     return parser
 
