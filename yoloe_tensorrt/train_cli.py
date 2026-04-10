@@ -66,6 +66,89 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip yoloe-tensorrt dataset validation before launching Ultralytics.",
     )
     parser.set_defaults(validate_dataset=True)
+    export_group = parser.add_argument_group("Export After Training")
+    export_group.add_argument(
+        "--export",
+        action="store_true",
+        help="Export the selected trained checkpoint into a yoloe-tensorrt artifact bundle after training.",
+    )
+    export_group.add_argument(
+        "--export-checkpoint",
+        choices=("best", "last"),
+        default=None,
+        help="Which trained checkpoint to export. Defaults to best when --export is enabled.",
+    )
+    export_group.add_argument(
+        "--export-artifact-dir",
+        default=None,
+        help="Artifact bundle output directory. Defaults to the standard export_model(...) location.",
+    )
+    export_group.add_argument(
+        "--export-format",
+        action="append",
+        dest="export_formats",
+        choices=("onnx", "engine"),
+        default=None,
+        help="Artifact format to generate after training. Repeat to request multiple formats. Defaults to both.",
+    )
+    export_group.add_argument(
+        "--export-dynamic",
+        action="store_true",
+        dest="export_dynamic",
+        help="Enable dynamic image shapes for post-training export.",
+    )
+    export_group.add_argument(
+        "--export-fixed",
+        action="store_false",
+        dest="export_dynamic",
+        help="Disable dynamic image shapes for post-training export.",
+    )
+    parser.set_defaults(export_dynamic=None)
+    export_group.add_argument(
+        "--export-no-visual-engine",
+        action="store_true",
+        help="Skip the visual-prompt TensorRT engine build during post-training export.",
+    )
+    export_group.add_argument(
+        "--export-no-fp16",
+        action="store_true",
+        help="Disable FP16 TensorRT builds during post-training export.",
+    )
+    export_group.add_argument(
+        "--export-imgsz",
+        type=lambda value: _parse_positive_int(value, "--export-imgsz"),
+        default=None,
+        help="Export image size. Defaults to the export_model(...) behavior when omitted.",
+    )
+    export_group.add_argument(
+        "--export-max-det",
+        type=lambda value: _parse_positive_int(value, "--export-max-det"),
+        default=None,
+        help="Maximum detections baked into export metadata. Defaults to 300.",
+    )
+    export_group.add_argument(
+        "--export-workspace-mb",
+        type=lambda value: _parse_positive_int(value, "--export-workspace-mb"),
+        default=None,
+        help="TensorRT builder workspace in MiB for post-training export. Defaults to 2048.",
+    )
+    export_group.add_argument(
+        "--export-exporter",
+        choices=("auto", "legacy", "dynamo"),
+        default=None,
+        help="ONNX exporter backend for post-training export. Defaults to auto.",
+    )
+    export_group.add_argument(
+        "--export-opset-version",
+        type=lambda value: _parse_positive_int(value, "--export-opset-version"),
+        default=None,
+        help="Override the ONNX opset version used for post-training export.",
+    )
+    export_group.add_argument(
+        "--export-overwrite",
+        action="store_true",
+        help="Overwrite existing artifacts during post-training export.",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level for the training command.")
     return parser
 
@@ -83,23 +166,47 @@ def main(argv: list[str] | None = None) -> int:
             if "resume" in overrides:
                 raise _CliArgumentError("--resume cannot be combined with --ultralytics-arg resume=...")
             overrides["resume"] = args.resume_checkpoint if args.resume_checkpoint is not None else True
+        if _has_export_options(args) and not args.export:
+            raise _CliArgumentError("--export must be provided when using --export-* options.")
     except _CliArgumentError as exc:
         parser.error(str(exc))
+
+    train_kwargs: dict[str, Any] = {
+        "task": args.task,
+        "imgsz": args.imgsz,
+        "epochs": int(args.epochs),
+        "batch": args.batch,
+        "device": args.device,
+        "output_dir": Path(args.output_dir),
+        "name": args.name,
+        "overrides": overrides,
+        "validate_dataset": bool(args.validate_dataset),
+        "exist_ok": bool(args.exist_ok),
+    }
+    if args.export:
+        train_kwargs.update(
+            export_artifact=True,
+            export_checkpoint=str(args.export_checkpoint or "best"),
+            export_artifact_dir=None if args.export_artifact_dir is None else Path(args.export_artifact_dir),
+            export_formats=tuple(args.export_formats or ("onnx", "engine")),
+            export_dynamic=True if args.export_dynamic is None else bool(args.export_dynamic),
+            export_build_visual_engine=not args.export_no_visual_engine,
+            export_fp16=not args.export_no_fp16,
+            export_imgsz=None if args.export_imgsz is None else int(args.export_imgsz),
+            export_max_det=300 if args.export_max_det is None else int(args.export_max_det),
+            export_overwrite=bool(args.export_overwrite),
+            export_workspace_bytes=(
+                (2048 if args.export_workspace_mb is None else int(args.export_workspace_mb)) << 20
+            ),
+            export_onnx_exporter=str(args.export_exporter or "auto"),
+            export_onnx_opset_version=None if args.export_opset_version is None else int(args.export_opset_version),
+        )
 
     try:
         result = train_model(
             args.model,
             Path(args.data),
-            task=args.task,
-            imgsz=args.imgsz,
-            epochs=int(args.epochs),
-            batch=args.batch,
-            device=args.device,
-            output_dir=Path(args.output_dir),
-            name=args.name,
-            overrides=overrides,
-            validate_dataset=bool(args.validate_dataset),
-            exist_ok=bool(args.exist_ok),
+            **train_kwargs,
         )
     except ImportError as exc:
         print(
@@ -123,6 +230,25 @@ def _parse_batch(value: str) -> int | float | str:
     if not isinstance(parsed, int | float | str):
         raise argparse.ArgumentTypeError("--batch must be an integer, float, or string such as auto.")
     return parsed
+
+
+def _has_export_options(args: argparse.Namespace) -> bool:
+    return any(
+        (
+            args.export_checkpoint is not None,
+            args.export_artifact_dir is not None,
+            bool(args.export_formats),
+            args.export_dynamic is not None,
+            bool(args.export_no_visual_engine),
+            bool(args.export_no_fp16),
+            args.export_imgsz is not None,
+            args.export_max_det is not None,
+            args.export_workspace_mb is not None,
+            args.export_exporter is not None,
+            args.export_opset_version is not None,
+            bool(args.export_overwrite),
+        )
+    )
 
 
 def _parse_imgsz(value: str) -> int | tuple[int, int]:
@@ -181,6 +307,10 @@ def _print_result(result: TrainingResult) -> None:
     print(f"run_dir: {result.run_dir}")
     if result.metrics_path is not None:
         print(f"metrics: {result.metrics_path}")
+    if result.exported_checkpoint_path is not None:
+        print(f"exported_checkpoint: {result.exported_checkpoint_path}")
+    if result.artifact_dir is not None:
+        print(f"artifact_dir: {result.artifact_dir}")
 
 
 if __name__ == "__main__":  # pragma: no cover

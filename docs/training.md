@@ -1,7 +1,8 @@
 # Training
 
 `yoloe-tensorrt` delegates YOLOE training and fine-tuning to Ultralytics while providing a package-level API that
-validates dataset configs before launching a run.
+validates dataset configs before launching a run and can export trained checkpoints directly into a TensorRT artifact
+bundle.
 
 ## Train or fine-tune
 
@@ -52,6 +53,40 @@ yoloe-train yoloe-26s-seg.pt data.yaml \
 
 By default, CLI run outputs are placed under `outputs/training`.
 
+## Export after training
+
+Use `--export` to send the trained checkpoint through the normal `export_model(...)` path immediately after training:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml \
+  --task segment \
+  --epochs 50 \
+  --export \
+  --export-artifact-dir outputs/artifacts/seg-run \
+  --export-format onnx \
+  --export-format engine
+```
+
+Export the last checkpoint instead of the default best checkpoint:
+
+```bash
+yoloe-train yoloe-26s-seg.pt data.yaml \
+  --resume \
+  --export \
+  --export-checkpoint last
+```
+
+The training CLI mirrors the export CLI through `--export-*` flags for formats, dynamic or fixed shapes, FP16,
+visual-prompt engine generation, export image size, max detections, workspace size, ONNX exporter, opset, and
+overwrite behavior.
+
+When export runs successfully, the CLI also prints:
+
+```text
+exported_checkpoint: outputs/training/seg-run/weights/best.pt
+artifact_dir: outputs/artifacts/seg-run
+```
+
 Use `train_model(...)` when you want the package to validate the dataset and call Ultralytics for you:
 
 ```python
@@ -72,7 +107,27 @@ print(result.run_dir)
 ```
 
 By default, run outputs are placed under `outputs/training`. The result includes the selected checkpoint path, the
-Ultralytics run directory, an optional metrics file path when one exists, and basic metadata about the run.
+Ultralytics run directory, an optional metrics file path when one exists, basic metadata about the run, and optional
+artifact export results when export is enabled.
+
+Export from Python by enabling `export_artifact` and selecting either the best or last checkpoint:
+
+```python
+result = train_model(
+    "yoloe-26s-seg.pt",
+    "data.yaml",
+    export_artifact=True,
+    export_checkpoint="best",
+    export_artifact_dir="outputs/artifacts/seg-run",
+)
+
+print(result.exported_checkpoint_path)
+print(result.artifact_dir)
+```
+
+The exported artifact bundle reuses the normal prompt-capable export path, so runtime text and visual prompt support
+are preserved for fine-tuned checkpoints. The bundle metadata also stores training traceability information such as the
+training run directory, selected checkpoint, dataset config path, and core training arguments.
 
 Pass advanced Ultralytics trainer options with `overrides`:
 

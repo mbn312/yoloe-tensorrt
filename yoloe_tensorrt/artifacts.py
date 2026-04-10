@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+
+def _json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_json_compatible(item) for item in value]
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,7 @@ class ArtifactMetadata:
     image_profile: ShapeProfile
     prompt_profile: ShapeProfile
     visual_profile: ShapeProfile | None
+    training_metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -64,6 +78,8 @@ class ArtifactMetadata:
         data["prompt_profile"] = self.prompt_profile.to_dict()
         if self.visual_profile is not None:
             data["visual_profile"] = self.visual_profile.to_dict()
+        if data["training_metadata"] is not None:
+            data["training_metadata"] = _json_compatible(data["training_metadata"])
         return data
 
     @classmethod
@@ -95,6 +111,7 @@ class ArtifactMetadata:
             image_profile=ShapeProfile.from_dict(data["image_profile"]),
             prompt_profile=ShapeProfile.from_dict(data["prompt_profile"]),
             visual_profile=None if data["visual_profile"] is None else ShapeProfile.from_dict(data["visual_profile"]),
+            training_metadata=None if data.get("training_metadata") is None else dict(data["training_metadata"]),
         )
 
 
