@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from ultralytics.data.augment import LetterBox
 
+from ._shapes import normalize_imgsz
 from .logging_utils import get_logger
 from .source import SourceItem
 from .tensor_utils import torch_from_numpy_safe
@@ -19,14 +20,6 @@ class PreprocessedSample:
     transformed: np.ndarray
     tensor: torch.Tensor
     path: str
-
-
-def normalize_imgsz(imgsz: int | tuple[int, int] | list[int]) -> tuple[int, int]:
-    if isinstance(imgsz, int):
-        return (imgsz, imgsz)
-    if len(imgsz) != 2:
-        raise ValueError(f"Expected imgsz with 2 elements, got {imgsz}")
-    return int(imgsz[0]), int(imgsz[1])
 
 
 def preprocess_image(

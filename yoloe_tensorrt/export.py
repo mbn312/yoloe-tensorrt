@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import inspect
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
 
@@ -10,10 +11,10 @@ import torch
 import torch.nn as nn
 from ultralytics.nn.modules import Detect
 
+from ._shapes import normalize_imgsz
 from .artifacts import ArtifactMetadata, ShapeProfile, default_artifact_dir, save_metadata
 from .assets import resolve_model_checkpoint, text_asset_search_roots
 from .logging_utils import get_logger
-from .preprocess import normalize_imgsz
 from .prompts import default_text_asset_name, resolve_text_asset_path, save_prompt_projector
 from .trt import build_engine_from_onnx
 
@@ -30,6 +31,33 @@ DYNAMO_ONNX_OPSET = 18
 OnnxExporterMode = Literal["auto", "legacy", "dynamo"]
 
 LOGGER = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ExportPaths:
+    artifact_root: Path
+    main_onnx_path: Path
+    main_engine_path: Path
+    visual_onnx_path: Path
+    visual_engine_path: Path
+    projector_path: Path
+
+
+@dataclass(frozen=True)
+class _ExportRequest:
+    model_path: Path
+    paths: _ExportPaths
+    requested_formats: tuple[str, ...]
+    dynamic: bool
+    build_visual_engine: bool
+    fp16: bool
+    imgsz: int | tuple[int, int] | list[int] | None
+    max_det: int
+    overwrite: bool
+    workspace_bytes: int
+    onnx_exporter: OnnxExporterMode
+    onnx_opset_version: int | None
+    training_metadata: Mapping[str, Any] | None
 
 
 def _load_yoloe_model(pt_path: str | Path) -> torch.nn.Module:
@@ -121,6 +149,63 @@ def _resolved_model_path(pt_path: str | Path) -> Path:
     resolved = resolve_model_checkpoint(pt_path)
     LOGGER.debug("Resolved model checkpoint '%s' -> '%s'", pt_path, resolved)
     return resolved
+
+
+def _resolve_export_request(
+    *,
+    pt_path: str | Path,
+    artifact_dir: str | Path | None,
+    formats: Iterable[str] | str,
+    dynamic: bool,
+    build_visual_engine: bool,
+    fp16: bool,
+    imgsz: int | tuple[int, int] | list[int] | None,
+    max_det: int,
+    overwrite: bool,
+    workspace_bytes: int,
+    onnx_exporter: OnnxExporterMode,
+    onnx_opset_version: int | None,
+    training_metadata: Mapping[str, Any] | None,
+) -> _ExportRequest:
+    model_path = _resolved_model_path(pt_path)
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else default_artifact_dir(model_path)
+    paths = _ExportPaths(
+        artifact_root=artifact_root,
+        main_onnx_path=artifact_root / MAIN_ONNX_FILENAME,
+        main_engine_path=artifact_root / MAIN_ENGINE_FILENAME,
+        visual_onnx_path=artifact_root / VISUAL_ONNX_FILENAME,
+        visual_engine_path=artifact_root / VISUAL_ENGINE_FILENAME,
+        projector_path=artifact_root / PROMPT_PROJECTOR_FILENAME,
+    )
+    return _ExportRequest(
+        model_path=model_path,
+        paths=paths,
+        requested_formats=tuple(_normalize_formats(formats)),
+        dynamic=bool(dynamic),
+        build_visual_engine=bool(build_visual_engine),
+        fp16=bool(fp16),
+        imgsz=imgsz,
+        max_det=int(max_det),
+        overwrite=bool(overwrite),
+        workspace_bytes=int(workspace_bytes),
+        onnx_exporter=onnx_exporter,
+        onnx_opset_version=None if onnx_opset_version is None else int(onnx_opset_version),
+        training_metadata=training_metadata,
+    )
+
+
+def _clear_export_outputs(paths: _ExportPaths) -> None:
+    for file_path in (
+        paths.main_onnx_path,
+        paths.main_engine_path,
+        paths.visual_onnx_path,
+        paths.visual_engine_path,
+        paths.projector_path,
+        paths.artifact_root / "metadata.json",
+    ):
+        if file_path.exists():
+            file_path.unlink()
+            LOGGER.debug("Removed stale artifact '%s'", file_path)
 
 
 def _make_image_profile(dynamic: bool, imgsz: tuple[int, int]) -> ShapeProfile:
@@ -381,45 +466,43 @@ def export_model(
     onnx_opset_version: int | None = None,
     training_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
-    model_path = _resolved_model_path(pt_path)
-    artifact_root = Path(artifact_dir) if artifact_dir is not None else default_artifact_dir(model_path)
+    request = _resolve_export_request(
+        pt_path=pt_path,
+        artifact_dir=artifact_dir,
+        formats=formats,
+        dynamic=dynamic,
+        build_visual_engine=build_visual_engine,
+        fp16=fp16,
+        imgsz=imgsz,
+        max_det=max_det,
+        overwrite=overwrite,
+        workspace_bytes=workspace_bytes,
+        onnx_exporter=onnx_exporter,
+        onnx_opset_version=onnx_opset_version,
+        training_metadata=training_metadata,
+    )
+    model_path = request.model_path
+    artifact_root = request.paths.artifact_root
     artifact_root.mkdir(parents=True, exist_ok=True)
-    requested_formats = set(_normalize_formats(formats))
-    main_onnx_path = artifact_root / MAIN_ONNX_FILENAME
-    main_engine_path = artifact_root / MAIN_ENGINE_FILENAME
-    visual_onnx_path = artifact_root / VISUAL_ONNX_FILENAME
-    visual_engine_path = artifact_root / VISUAL_ENGINE_FILENAME
-    projector_path = artifact_root / PROMPT_PROJECTOR_FILENAME
     LOGGER.info(
         "Starting export for '%s' -> '%s' (formats=%s, dynamic=%s, fp16=%s, build_visual_engine=%s, "
         "onnx_exporter=%s, onnx_opset_version=%s)",
         model_path,
         artifact_root,
-        tuple(requested_formats),
-        dynamic,
-        fp16,
-        build_visual_engine,
-        onnx_exporter,
-        onnx_opset_version if onnx_opset_version is not None else "default",
+        request.requested_formats,
+        request.dynamic,
+        request.fp16,
+        request.build_visual_engine,
+        request.onnx_exporter,
+        request.onnx_opset_version if request.onnx_opset_version is not None else "default",
     )
 
-    if overwrite:
-        for filename in (
-            main_onnx_path.name,
-            main_engine_path.name,
-            visual_onnx_path.name,
-            visual_engine_path.name,
-            projector_path.name,
-            "metadata.json",
-        ):
-            file_path = artifact_root / filename
-            if file_path.exists():
-                file_path.unlink()
-                LOGGER.debug("Removed stale artifact '%s'", file_path)
+    if request.overwrite:
+        _clear_export_outputs(request.paths)
 
     model = _load_yoloe_model(model_path)
-    default_imgsz = normalize_imgsz(imgsz or getattr(model, "args", {}).get("imgsz", 640))
-    _configure_export_state(model, default_imgsz, dynamic=dynamic, max_det=max_det)
+    default_imgsz = normalize_imgsz(request.imgsz or getattr(model, "args", {}).get("imgsz", 640))
+    _configure_export_state(model, default_imgsz, dynamic=request.dynamic, max_det=request.max_det)
 
     task = getattr(model, "task", "detect")
     end2end = bool(getattr(model, "end2end", False))
@@ -438,18 +521,21 @@ def export_model(
         text_model,
     )
 
-    image_profile = _make_image_profile(dynamic=dynamic, imgsz=default_imgsz)
+    image_profile = _make_image_profile(dynamic=request.dynamic, imgsz=default_imgsz)
     prompt_profile = _make_prompt_profile(embed_dim=embed_dim)
     visual_profile = _make_visual_profile(
-        dynamic=dynamic, prompt_profile=prompt_profile, image_profile=image_profile, visual_stride=visual_stride
+        dynamic=request.dynamic,
+        prompt_profile=prompt_profile,
+        image_profile=image_profile,
+        visual_stride=visual_stride,
     )
 
     text_encoder_filename = _save_text_encoder_asset(text_model, model_path, artifact_root)
-    if overwrite or not projector_path.is_file():
-        save_prompt_projector(head.reprta, projector_path, embed_dim=embed_dim)
-        LOGGER.info("Saved prompt projector to '%s'", projector_path)
+    if request.overwrite or not request.paths.projector_path.is_file():
+        save_prompt_projector(head.reprta, request.paths.projector_path, embed_dim=embed_dim)
+        LOGGER.info("Saved prompt projector to '%s'", request.paths.projector_path)
     else:
-        LOGGER.info("Reusing existing prompt projector at '%s'", projector_path)
+        LOGGER.info("Reusing existing prompt projector at '%s'", request.paths.projector_path)
 
     image_example = torch.randn(image_profile.optimum, dtype=torch.float32)
     prompt_example = torch.randn(prompt_profile.optimum, dtype=torch.float32)
@@ -461,37 +547,37 @@ def export_model(
         PROMPT_INPUT_NAME: {0: "batch", 1: "num_prompts"},
         "output0": {0: "batch"},
     }
-    if dynamic:
+    if request.dynamic:
         main_dynamic_axes[IMAGE_INPUT_NAME] = {0: "batch", 2: "height", 3: "width"}
     if task == "segment":
         main_dynamic_axes["output1"] = {0: "batch"}
-        if dynamic:
+        if request.dynamic:
             main_dynamic_axes["output1"].update({2: "mask_height", 3: "mask_width"})
-    if overwrite or not main_onnx_path.is_file():
+    if request.overwrite or not request.paths.main_onnx_path.is_file():
         _export_onnx(
             main_wrapper,
             (image_example, prompt_example),
-            main_onnx_path,
+            request.paths.main_onnx_path,
             input_names=[IMAGE_INPUT_NAME, PROMPT_INPUT_NAME],
             output_names=main_output_names,
             dynamic_axes=main_dynamic_axes,
-            exporter=onnx_exporter,
-            opset_version=onnx_opset_version,
+            exporter=request.onnx_exporter,
+            opset_version=request.onnx_opset_version,
         )
     else:
-        LOGGER.info("Reusing existing main ONNX graph at '%s'", main_onnx_path)
+        LOGGER.info("Reusing existing main ONNX graph at '%s'", request.paths.main_onnx_path)
 
     visual_onnx_filename: str | None = None
     visual_engine_filename: str | None = None
     visual_wrapper: nn.Module | None = None
-    if build_visual_engine:
+    if request.build_visual_engine:
         visual_wrapper = _VisualPromptWrapper(model).eval()
         visual_onnx_filename = VISUAL_ONNX_FILENAME
-        if overwrite or not visual_onnx_path.is_file():
+        if request.overwrite or not request.paths.visual_onnx_path.is_file():
             _export_onnx(
                 visual_wrapper,
                 (image_example, visual_example),
-                visual_onnx_path,
+                request.paths.visual_onnx_path,
                 input_names=[IMAGE_INPUT_NAME, VISUAL_INPUT_NAME],
                 output_names=["prompt_embeddings"],
                 dynamic_axes=(
@@ -500,18 +586,18 @@ def export_model(
                         VISUAL_INPUT_NAME: {0: "batch", 1: "num_prompts", 2: "prompt_height", 3: "prompt_width"},
                         "prompt_embeddings": {0: "batch", 1: "num_prompts"},
                     }
-                    if dynamic
+                    if request.dynamic
                     else {
                         VISUAL_INPUT_NAME: {0: "batch", 1: "num_prompts"},
                         "prompt_embeddings": {0: "batch", 1: "num_prompts"},
                     }
                 ),
-                exporter=onnx_exporter,
-                opset_version=onnx_opset_version,
+                exporter=request.onnx_exporter,
+                opset_version=request.onnx_opset_version,
             )
-            LOGGER.info("Exported visual prompt ONNX graph to '%s'", visual_onnx_path)
+            LOGGER.info("Exported visual prompt ONNX graph to '%s'", request.paths.visual_onnx_path)
         else:
-            LOGGER.info("Reusing existing visual prompt ONNX graph at '%s'", visual_onnx_path)
+            LOGGER.info("Reusing existing visual prompt ONNX graph at '%s'", request.paths.visual_onnx_path)
 
     model = None
     head = None
@@ -525,41 +611,41 @@ def export_model(
         torch.cuda.empty_cache()
 
     main_engine_filename: str | None = None
-    if "engine" in requested_formats:
-        if overwrite or not main_engine_path.is_file():
-            LOGGER.info("Building main TensorRT engine from '%s'", main_onnx_path)
+    if "engine" in request.requested_formats:
+        if request.overwrite or not request.paths.main_engine_path.is_file():
+            LOGGER.info("Building main TensorRT engine from '%s'", request.paths.main_onnx_path)
             build_engine_from_onnx(
-                main_onnx_path,
-                main_engine_path,
+                request.paths.main_onnx_path,
+                request.paths.main_engine_path,
                 profiles={
                     IMAGE_INPUT_NAME: image_profile,
                     PROMPT_INPUT_NAME: prompt_profile,
                 },
-                fp16=fp16,
-                workspace_bytes=workspace_bytes,
+                fp16=request.fp16,
+                workspace_bytes=request.workspace_bytes,
             )
-            LOGGER.info("Built main TensorRT engine at '%s'", main_engine_path)
+            LOGGER.info("Built main TensorRT engine at '%s'", request.paths.main_engine_path)
         else:
-            LOGGER.info("Reusing existing main TensorRT engine at '%s'", main_engine_path)
-        if main_engine_path.is_file():
+            LOGGER.info("Reusing existing main TensorRT engine at '%s'", request.paths.main_engine_path)
+        if request.paths.main_engine_path.is_file():
             main_engine_filename = MAIN_ENGINE_FILENAME
-        if build_visual_engine and visual_onnx_filename is not None:
-            if overwrite or not visual_engine_path.is_file():
-                LOGGER.info("Building visual prompt TensorRT engine from '%s'", visual_onnx_path)
+        if request.build_visual_engine and visual_onnx_filename is not None:
+            if request.overwrite or not request.paths.visual_engine_path.is_file():
+                LOGGER.info("Building visual prompt TensorRT engine from '%s'", request.paths.visual_onnx_path)
                 build_engine_from_onnx(
-                    visual_onnx_path,
-                    visual_engine_path,
+                    request.paths.visual_onnx_path,
+                    request.paths.visual_engine_path,
                     profiles={
                         IMAGE_INPUT_NAME: image_profile,
                         VISUAL_INPUT_NAME: visual_profile,
                     },
-                    fp16=fp16,
-                    workspace_bytes=workspace_bytes,
+                    fp16=request.fp16,
+                    workspace_bytes=request.workspace_bytes,
                 )
-                LOGGER.info("Built visual prompt TensorRT engine at '%s'", visual_engine_path)
+                LOGGER.info("Built visual prompt TensorRT engine at '%s'", request.paths.visual_engine_path)
             else:
-                LOGGER.info("Reusing existing visual prompt TensorRT engine at '%s'", visual_engine_path)
-            if visual_engine_path.is_file():
+                LOGGER.info("Reusing existing visual prompt TensorRT engine at '%s'", request.paths.visual_engine_path)
+            if request.paths.visual_engine_path.is_file():
                 visual_engine_filename = VISUAL_ENGINE_FILENAME
 
     metadata = ArtifactMetadata(
@@ -568,14 +654,14 @@ def export_model(
         model_name=model_path.name,
         task=task,
         end2end=end2end,
-        dynamic=dynamic,
+        dynamic=request.dynamic,
         default_imgsz=default_imgsz,
         stride=stride,
         visual_stride=visual_stride,
         embed_dim=embed_dim,
         mask_dim=mask_dim,
-        max_det=max_det,
-        fp16=fp16,
+        max_det=request.max_det,
+        fp16=request.fp16,
         prompt_input_name=PROMPT_INPUT_NAME,
         visual_input_name=VISUAL_INPUT_NAME,
         image_input_name=IMAGE_INPUT_NAME,
@@ -588,8 +674,8 @@ def export_model(
         visual_engine_filename=visual_engine_filename,
         image_profile=image_profile,
         prompt_profile=prompt_profile,
-        visual_profile=visual_profile if build_visual_engine else None,
-        training_metadata=None if training_metadata is None else dict(training_metadata),
+        visual_profile=visual_profile if request.build_visual_engine else None,
+        training_metadata=None if request.training_metadata is None else dict(request.training_metadata),
     )
     save_metadata(artifact_root, metadata)
     LOGGER.info("Saved artifact metadata to '%s'", artifact_root / "metadata.json")

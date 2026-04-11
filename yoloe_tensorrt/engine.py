@@ -10,12 +10,13 @@ from torch.utils.dlpack import from_dlpack
 from ultralytics.engine.results import Results
 from ultralytics.utils import nms, ops
 
+from ._inference_types import PreparedExecutionInput, PreparedTensorInput, prepare_tensor_input
+from ._shapes import normalize_imgsz
 from .artifacts import ArtifactMetadata, default_artifact_dir, load_metadata, resolve_artifact_file
 from .assets import text_asset_search_roots
 from .export import export_model
 from .inputs import (
     InferenceSourceItem,
-    PreparedTensorInput,
     iter_inference_sources,
     validate_prepared_tensor,
 )
@@ -24,7 +25,7 @@ from .native_backend import (
     build_native_main_runtime,
     build_native_visual_runtime,
 )
-from .preprocess import normalize_imgsz, preprocess_image
+from .preprocess import preprocess_image
 from .prompts import (
     TextPromptEncoder,
     build_visual_prompt_batch,
@@ -228,12 +229,16 @@ class YOLOEEngine:
         return cached
 
     @property
-    def _main_fp16(self) -> bool:
+    def main_fp16(self) -> bool:
         if self.native_main_runtime is not None:
             return bool(self.native_main_runtime.fp16)
         if self.main_runtime is None:
             raise RuntimeError("Main runtime is not initialized")
         return self.main_runtime.fp16
+
+    @property
+    def prompt_generation(self) -> int:
+        return int(self._prompt_generation)
 
     def _sync_native_prompt_embeddings(self) -> None:
         if self.native_main_runtime is None:
@@ -558,7 +563,7 @@ class YOLOEEngine:
                 item,
                 imgsz=imgsz,
                 device=self.device,
-                fp16=self._main_fp16,
+                fp16=self.main_fp16,
                 stride=self.metadata.stride,
             )
             preprocess_ms = (time.perf_counter() - preprocess_start) * 1000.0
@@ -677,20 +682,10 @@ class YOLOEEngine:
         result.speed = speed
         return result
 
-    def _predict_prepared_tensor(
-        self,
-        item: PreparedTensorInput,
-        conf: float,
-        iou: float,
-        max_det: int,
-        retina_masks: bool,
-    ) -> Results:
-        if self.native_main_runtime is not None:
-            prompt_embeddings = None
-            names = self._active_prompt_names()
-        else:
-            prompt_embeddings, names = self._active_prompt_embeddings()
+    def _resolve_max_det(self, max_det: int | None) -> int:
+        return int(max_det or self.metadata.max_det)
 
+    def _prepare_execution_input(self, item: PreparedTensorInput) -> PreparedExecutionInput:
         image_tensor = item.tensor
         validate_prepared_tensor(image_tensor)
         if image_tensor.ndim == 3:
@@ -710,7 +705,7 @@ class YOLOEEngine:
             image_tensor = image_tensor.to(device=self.device)
             current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
-        target_dtype = torch.float16 if self._main_fp16 else torch.float32
+        target_dtype = torch.float16 if self.main_fp16 else torch.float32
         if image_tensor.dtype != target_dtype:
             image_tensor = image_tensor.to(dtype=target_dtype)
             if current_stream is None:
@@ -725,8 +720,29 @@ class YOLOEEngine:
             if current_stream is None:
                 current_stream = int(torch.cuda.current_stream(self.device).cuda_stream)
             producer_stream = current_stream
+        return PreparedExecutionInput(
+            tensor=image_tensor,
+            input_shape=(int(image_tensor.shape[2]), int(image_tensor.shape[3])),
+            producer_stream=int(producer_stream),
+        )
 
-        input_shape = (int(image_tensor.shape[2]), int(image_tensor.shape[3]))
+    def _predict_prepared_tensor(
+        self,
+        item: PreparedTensorInput,
+        conf: float,
+        iou: float,
+        max_det: int,
+        retina_masks: bool,
+    ) -> Results:
+        if self.native_main_runtime is not None:
+            prompt_embeddings = None
+            names = self._active_prompt_names()
+        else:
+            prompt_embeddings, names = self._active_prompt_embeddings()
+
+        prepared = self._prepare_execution_input(item)
+        image_tensor = prepared.tensor
+        input_shape = prepared.input_shape
         original_image, result_path = self._resolve_original_image_path(item.original_image, item.path, input_shape)
         if self.native_main_runtime is not None:
             native_infer_tensor_postprocessed = self._native_infer_tensor_postprocessed
@@ -741,7 +757,7 @@ class YOLOEEngine:
                     float(iou),
                     int(max_det),
                     bool(retina_masks),
-                    producer_stream,
+                    prepared.producer_stream,
                 )
                 result = self._build_native_postprocessed_result(
                     native_outputs=native_outputs,
@@ -760,7 +776,7 @@ class YOLOEEngine:
                         int(image_tensor.data_ptr()),
                         input_shape[0],
                         input_shape[1],
-                        producer_stream,
+                        prepared.producer_stream,
                     ),
                     original_image=original_image,
                     path=result_path,
@@ -848,7 +864,7 @@ class YOLOEEngine:
         max_det: int | None = None,
         retina_masks: bool = False,
     ) -> Results:
-        resolved_max_det = int(max_det or self.metadata.max_det)
+        resolved_max_det = self._resolve_max_det(max_det)
         return self._predict_input_entry(
             item=item,
             imgsz=imgsz,
@@ -869,11 +885,11 @@ class YOLOEEngine:
             item,
             imgsz=target_size,
             device=self.device,
-            fp16=self._main_fp16,
+            fp16=self.main_fp16,
             stride=self.metadata.stride,
         )
-        return PreparedTensorInput(
-            tensor=sample.tensor,
+        return prepare_tensor_input(
+            sample.tensor,
             path=item.path,
             original_image=item,
         )
@@ -889,15 +905,11 @@ class YOLOEEngine:
         max_det: int | None = None,
         retina_masks: bool = False,
     ) -> Results:
-        resolved_max_det = int(max_det or self.metadata.max_det)
-        prepared = (
-            tensor
-            if isinstance(tensor, PreparedTensorInput)
-            else PreparedTensorInput(
-                tensor=tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor),
-                path=path or "tensor0",
-                original_image=original_image,
-            )
+        resolved_max_det = self._resolve_max_det(max_det)
+        prepared = prepare_tensor_input(
+            tensor,
+            path=path or "tensor0",
+            original_image=original_image,
         )
         return self._predict_prepared_tensor(
             item=prepared,
@@ -1007,7 +1019,7 @@ class YOLOEEngine:
         path: str | None = None,
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
-        resolved_max_det = int(max_det or self.metadata.max_det)
+        resolved_max_det = self._resolve_max_det(max_det)
         LOGGER.debug(
             "Starting predict(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d)",
             stream,
@@ -1051,7 +1063,7 @@ class YOLOEEngine:
         path: str | None = None,
     ) -> list[Results] | Iterator[Results]:
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
-        resolved_max_det = int(max_det or self.metadata.max_det)
+        resolved_max_det = self._resolve_max_det(max_det)
         LOGGER.debug(
             "Starting track(stream=%s, imgsz=%s, conf=%.3f, iou=%.3f, max_det=%d, tracker=%s)",
             stream,

@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ._shapes import normalize_imgsz
 from ._version import __version__
 from .logging_utils import configure_logging
 
@@ -821,7 +822,6 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging(level=args.log_level, include_timestamps=True)
 
-    from .preprocess import normalize_imgsz
     from .source import normalize_source
 
     labels = list(args.labels or ["bus"])
@@ -913,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "camera" in selected_modes:
         try:
-            camera_fp16 = bool(getattr(engine, "_main_fp16"))
+            camera_fp16 = bool(getattr(engine, "main_fp16", False))
         except Exception:
             camera_fp16 = False
         camera_source = _camera_source_from_spec(

@@ -1,9 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
+from dataclasses import dataclass
 
 from ._version import __version__
+
+
+@dataclass(frozen=True)
+class _CommandSpec:
+    name: str
+    help: str
+    module_path: str
+
+
+_COMMANDS = (
+    _CommandSpec("camera-gui", "Launch the live camera GUI.", "yoloe_tensorrt.gui"),
+    _CommandSpec("export", "Export a YOLOE checkpoint into an artifact bundle.", "yoloe_tensorrt.export_cli"),
+    _CommandSpec("benchmark", "Benchmark runtime performance.", "yoloe_tensorrt.benchmark_cli"),
+    _CommandSpec("train", "Train or fine-tune a YOLOE checkpoint.", "yoloe_tensorrt.train_cli"),
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -12,39 +29,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command")
-
-    camera_parser = subparsers.add_parser("camera-gui", help="Launch the live camera GUI.")
-    camera_parser.set_defaults(handler="camera-gui")
-
-    export_parser = subparsers.add_parser("export", help="Export a YOLOE checkpoint into an artifact bundle.")
-    export_parser.set_defaults(handler="export")
-
-    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark runtime performance.")
-    benchmark_parser.set_defaults(handler="benchmark")
-
-    train_parser = subparsers.add_parser("train", help="Train or fine-tune a YOLOE checkpoint.")
-    train_parser.set_defaults(handler="train")
+    for command in _COMMANDS:
+        subparsers.add_parser(command.name, help=command.help)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["camera-gui"]:
-        from .gui import main as gui_main
-
-        return gui_main(argv[1:])
-    if argv[:1] == ["export"]:
-        from .export_cli import main as export_main
-
-        return export_main(argv[1:])
-    if argv[:1] == ["benchmark"]:
-        from .benchmark_cli import main as benchmark_main
-
-        return benchmark_main(argv[1:])
-    if argv[:1] == ["train"]:
-        from .train_cli import main as train_main
-
-        return train_main(argv[1:])
+    if argv[:1]:
+        for command in _COMMANDS:
+            if argv[0] == command.name:
+                return importlib.import_module(command.module_path).main(argv[1:])
 
     parser = build_arg_parser()
     parser.parse_args(argv)

@@ -11,10 +11,10 @@ from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 import cv2
 from PIL import Image, ImageTk
 
+from ._shapes import normalize_imgsz
 from .assets import default_example_model_spec, resolve_model_checkpoint
 from .gstreamer import camera_source_from_spec
 from .logging_utils import configure_logging, get_logger
-from .preprocess import normalize_imgsz
 from .tracking import AVAILABLE_TRACKERS, DEFAULT_TRACKER, normalize_tracker_name
 
 if TYPE_CHECKING:
@@ -825,7 +825,7 @@ def run_camera_gui(
                 zero_copy=None,
                 preview_cpu=True,
                 target_imgsz=target_size,
-                fp16=engine._main_fp16,
+                fp16=bool(engine.main_fp16),
                 device=engine.device,
             )
 

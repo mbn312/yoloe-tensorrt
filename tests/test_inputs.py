@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 from yoloe_tensorrt.engine import YOLOEEngine
 from yoloe_tensorrt.inputs import (
     PreparedTensorInput,
@@ -65,6 +66,16 @@ def test_validate_prepared_tensor_rejects_integer_dtype() -> None:
 
     with pytest.raises(ValueError, match="floating point dtype"):
         validate_prepared_tensor(tensor)
+
+
+def test_normalize_inference_source_accepts_pil_images() -> None:
+    image = Image.fromarray(np.full((4, 4, 3), 127, dtype=np.uint8), mode="RGB")
+
+    item = normalize_inference_source(image)[0]
+
+    assert isinstance(item, SourceItem)
+    assert item.path == "image0"
+    assert item.image.shape == (4, 4, 3)
 
 
 def test_preprocess_image_preserves_unit_range_float_inputs() -> None:
@@ -214,6 +225,14 @@ def test_normalize_single_inference_source_returns_one_item() -> None:
 
     assert isinstance(item, SourceItem)
     assert item.path == "image0"
+
+
+def test_normalize_single_inference_source_accepts_top_level_pil_images() -> None:
+    item = normalize_single_inference_source(Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8), mode="RGB"))
+
+    assert isinstance(item, SourceItem)
+    assert item.path == "image0"
+    assert item.image.shape == (4, 4, 3)
 
 
 def test_normalize_single_inference_source_rejects_empty_iterables() -> None:

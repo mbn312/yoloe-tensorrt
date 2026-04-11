@@ -506,7 +506,7 @@ def test_benchmark_all_mode_writes_host_cuda_and_camera_results(
             pass
 
         @property
-        def _main_fp16(self) -> bool:
+        def main_fp16(self) -> bool:
             return False
 
         def prepare_cuda_input(self, item: SourceItem, **_kwargs):
@@ -640,7 +640,7 @@ def test_benchmark_camera_mode_uses_finite_source(monkeypatch: pytest.MonkeyPatc
             pass
 
         @property
-        def _main_fp16(self) -> bool:
+        def main_fp16(self) -> bool:
             return True
 
         def predict_item(self, *_args, **_kwargs):
@@ -708,7 +708,7 @@ def test_benchmark_camera_mode_closes_source_on_early_exhaustion(
             pass
 
         @property
-        def _main_fp16(self) -> bool:
+        def main_fp16(self) -> bool:
             return False
 
         def predict_item(self, *_args, **_kwargs):

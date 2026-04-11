@@ -10,7 +10,8 @@ import yaml
 from ultralytics.engine.results import Results
 from ultralytics.utils import IterableSimpleNamespace
 
-from .inputs import InferenceSourceItem, PreparedTensorInput, normalize_single_inference_source
+from ._inference_types import prepare_tensor_input
+from .inputs import InferenceSourceItem, normalize_single_inference_source
 from .logging_utils import get_logger
 from .source import SourceItem
 
@@ -142,7 +143,7 @@ class YOLOETrackerSession:
         self._tracker_config_input = tracker_config
         self._tracker_config = resolve_tracker_config(self.tracker_name, tracker_config)
         self._backend = _build_tracker_backend(self.tracker_name, self._tracker_config, self.frame_rate)
-        self._prompt_generation = int(engine._prompt_generation)
+        self._prompt_generation = int(engine.prompt_generation)
         self._source_key: str | None = None
         LOGGER.info(
             "Initialized tracker session backend='%s' frame_rate=%d",
@@ -156,12 +157,12 @@ class YOLOETrackerSession:
 
     def reset(self) -> None:
         self._backend = _build_tracker_backend(self.tracker_name, self._tracker_config, self.frame_rate)
-        self._prompt_generation = int(self.engine._prompt_generation)
+        self._prompt_generation = int(self.engine.prompt_generation)
         self._source_key = None
         LOGGER.info("Reset tracker session backend='%s'", self.tracker_name)
 
     def _reset_if_needed(self, source_key: str | None) -> None:
-        if self._prompt_generation != int(self.engine._prompt_generation):
+        if self._prompt_generation != int(self.engine.prompt_generation):
             LOGGER.info("Resetting tracker session because active prompts changed")
             self.reset()
 
@@ -193,7 +194,6 @@ class YOLOETrackerSession:
         path: str | None = None,
     ) -> Results:
         self._reset_if_needed(source_key)
-        resolved_max_det = int(max_det or self.engine.metadata.max_det)
         item = normalize_single_inference_source(
             frame,
             default_prefix="frame",
@@ -203,12 +203,12 @@ class YOLOETrackerSession:
             path=path,
             multiple_error="YOLOETrackerSession.update expects a single frame input",
         )
-        result = self.engine._predict_input_entry(
-            item=item,
+        result = self.engine.predict_item(
+            item,
             imgsz=imgsz,
             conf=conf,
             iou=iou,
-            max_det=resolved_max_det,
+            max_det=max_det,
             retina_masks=retina_masks,
         )
         return _apply_tracking_to_result(result, self._backend)
@@ -225,14 +225,10 @@ class YOLOETrackerSession:
         max_det: int | None = None,
         retina_masks: bool = False,
     ) -> Results:
-        prepared = (
-            tensor
-            if isinstance(tensor, PreparedTensorInput)
-            else PreparedTensorInput(
-                tensor=tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor),
-                path=path or "tensor0",
-                original_image=original_image,
-            )
+        prepared = prepare_tensor_input(
+            tensor,
+            path=path or "tensor0",
+            original_image=original_image,
         )
         return self.update(
             prepared,

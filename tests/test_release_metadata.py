@@ -23,6 +23,14 @@ def test_load_project_version_reads_current_pyproject() -> None:
     assert load_project_version("pyproject.toml") == CURRENT_VERSION
 
 
+def test_load_project_version_raises_value_error_for_invalid_toml(tmp_path: Path) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nversion =\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unable to parse project metadata"):
+        load_project_version(pyproject)
+
+
 def test_changelog_has_version_matches_current_release() -> None:
     assert changelog_has_version("CHANGELOG.md", CURRENT_VERSION)
 

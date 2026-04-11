@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal
 
@@ -9,45 +8,22 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .gstreamer import camera_source_from_spec, is_rtsp_uri
+from ._camera_spec import is_rtsp_uri
+from ._inference_types import PreparedTensorInput, prepare_tensor_input
+from .gstreamer import camera_source_from_spec
 from .logging_utils import get_logger
 from .source import (
-    PreparedFrameMetadata,
     SourceItem,
     SourceStream,
     _is_iterable_source,
-    _load_path,
-    _normalize_array,
-    _pil_to_bgr,
     is_finite_live_source,
     is_live_source,
+    source_item_from_value,
 )
 
 LOGGER = get_logger(__name__)
 
 InputHint = Literal["auto", "raw", "prepared"]
-
-
-@dataclass(frozen=True)
-class PreparedTensorInput:
-    tensor: torch.Tensor
-    path: str
-    original_image: SourceItem | PreparedFrameMetadata | object | None = None
-    producer_stream: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.producer_stream is None and self.tensor.device.type == "cuda":
-            object.__setattr__(self, "producer_stream", int(torch.cuda.current_stream(self.tensor.device).cuda_stream))
-
-    @property
-    def original_item(self) -> SourceItem | None:
-        if isinstance(self.original_image, SourceItem):
-            return self.original_image
-        return None
-
-    def __iter__(self):
-        yield self.tensor
-        yield self.original_item
 
 
 InferenceSourceItem = SourceItem | PreparedTensorInput
@@ -158,13 +134,13 @@ def iter_inference_sources(
                 prefix=path or "rtsp",
             )
             return
-        yield _load_path(source)
+        yield source_item_from_value(source, path=path or f"{default_prefix}0")
         return
     if isinstance(source, Image.Image):
-        yield SourceItem(image=_pil_to_bgr(source), path=path or f"{default_prefix}0")
+        yield source_item_from_value(source, path=path or f"{default_prefix}0")
         return
     if isinstance(source, np.ndarray):
-        yield SourceItem(image=_normalize_array(source), path=path or f"{default_prefix}0")
+        yield source_item_from_value(source, path=path or f"{default_prefix}0")
         return
     if _is_iterable_source(source):
         for index, item in enumerate(source):
@@ -209,8 +185,8 @@ def _iter_tensor_source(
         if cuda is False:
             raise ValueError("input_hint='prepared' cannot be combined with cuda=False")
         validate_prepared_tensor(tensor)
-        yield PreparedTensorInput(
-            tensor=tensor,
+        yield prepare_tensor_input(
+            tensor,
             path=item_path,
             original_image=original_image,
         )

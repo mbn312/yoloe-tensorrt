@@ -6,9 +6,12 @@ from pathlib import Path
 import numpy as np
 from torch.utils.dlpack import from_dlpack
 
+from ._camera_spec import is_rtsp_uri as _is_rtsp_uri
+from ._camera_spec import parse_camera_source_spec
+from ._inference_types import prepare_tensor_input
+from ._shapes import normalize_imgsz
 from .logging_utils import get_logger
 from .native_backend import JETSON_ZERO_COPY_AVAILABLE, build_native_jetson_camera_source
-from .preprocess import normalize_imgsz
 from .source import PreparedFrameMetadata, SourceItem, SourceStream
 
 LOGGER = get_logger(__name__)
@@ -16,17 +19,6 @@ LOGGER = get_logger(__name__)
 _GST = None
 _GST_APP = None
 _GST_VIDEO = None
-_RTSP_SCHEMES = (
-    "rtsp://",
-    "rtsps://",
-    "rtspu://",
-    "rtspt://",
-    "rtsph://",
-    "rtsp-sdp://",
-    "rtspsu://",
-    "rtspst://",
-    "rtspsh://",
-)
 
 
 def _require_gst():
@@ -55,8 +47,7 @@ def _require_gst():
 
 
 def is_rtsp_uri(source_value: str | Path) -> bool:
-    source_text = str(source_value).strip().lower()
-    return source_text.startswith(_RTSP_SCHEMES)
+    return _is_rtsp_uri(source_value)
 
 
 def _gst_quote(value: str) -> str:
@@ -217,15 +208,15 @@ def camera_source_from_spec(
     fp16: bool = False,
     device: str | int = "cuda:0",
 ) -> SourceStream:
-    source_text = str(source_value).strip()
-    lowered = source_text.lower()
+    source_spec = parse_camera_source_spec(source_value)
+    source_text = source_spec.raw_value
     resolved_width = 640 if width is None else int(width)
     resolved_height = 480 if height is None else int(height)
     resolved_fps = 30 if fps is None else int(fps)
     fallback_source: SourceStream
     zero_copy_pipeline: str | None = None
     zero_copy_supported = False
-    if is_rtsp_uri(source_text):
+    if source_spec.kind == "rtsp":
         fallback_source = GStreamerSource.rtsp(
             source_text,
             width=width,
@@ -242,7 +233,7 @@ def camera_source_from_spec(
             fps=fps,
         )
         zero_copy_supported = True
-    elif "!" in source_text:
+    elif source_spec.kind == "pipeline":
         fallback_source = GStreamerSource(
             pipeline=source_text,
             prefix=prefix,
@@ -251,22 +242,20 @@ def camera_source_from_spec(
         )
         zero_copy_pipeline = source_text
         zero_copy_supported = True
-    elif lowered in {"dummy", "videotest", "videotestsrc"} or lowered.startswith(("dummy://", "videotest://")):
-        pattern = source_text.split("://", 1)[1].strip() if "://" in source_text else "ball"
-        pattern = pattern or "ball"
+    elif source_spec.kind == "dummy":
         fallback_source = GStreamerSource(
             pipeline=build_dummy_video_pipeline(
                 width=resolved_width,
                 height=resolved_height,
                 fps=resolved_fps,
-                pattern=pattern,
+                pattern=source_spec.dummy_pattern or "ball",
             ),
             prefix=prefix,
             max_frames=max_frames,
             timeout_s=timeout_s,
         )
     else:
-        device_path = Path(source_text)
+        device_path = source_spec.device_path or Path(source_text)
         if not device_path.exists():
             raise FileNotFoundError(f"Camera source device is missing: {device_path}")
         fallback_source = GStreamerSource.usb_camera(
@@ -447,8 +436,6 @@ class JetsonZeroCopySource(SourceStream):
     is_live_source: bool = True
 
     def __iter__(self):
-        from .inputs import PreparedTensorInput
-
         native_source = build_native_jetson_camera_source(
             self.pipeline,
             prefix=self.prefix,
@@ -487,8 +474,8 @@ class JetsonZeroCopySource(SourceStream):
                     path=path,
                     preview_image=preview_image,
                 )
-                yield PreparedTensorInput(
-                    tensor=from_dlpack(frame["tensor"]),
+                yield prepare_tensor_input(
+                    from_dlpack(frame["tensor"]),
                     path=path,
                     original_image=metadata,
                     producer_stream=int(frame["producer_stream"]),
