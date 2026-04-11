@@ -58,39 +58,59 @@ class TensorRTRuntime:
             raise RuntimeError(f"Failed to deserialize TensorRT engine '{self.engine_path}'")
         self.context = self.engine.create_execution_context()
         LOGGER.info("Loaded TensorRT engine '%s' on device '%s'", self.engine_path, self.device)
-        self.is_trt10 = not hasattr(self.engine, "num_bindings")
+        self.uses_tensor_io_api = all(
+            hasattr(self.engine, name)
+            for name in (
+                "num_io_tensors",
+                "get_tensor_name",
+                "get_tensor_mode",
+                "get_tensor_dtype",
+                "get_tensor_shape",
+                "get_tensor_profile_shape",
+            )
+        ) and hasattr(self.context, "set_input_shape")
+        self._binding_count = self.engine.num_io_tensors if self.uses_tensor_io_api else self.engine.num_bindings
         self.bindings: OrderedDict[str, TensorBinding] = OrderedDict()
         self.input_names: list[str] = []
         self.output_names: list[str] = []
-
-        count = self.engine.num_io_tensors if self.is_trt10 else self.engine.num_bindings
-        for index in range(count):
-            if self.is_trt10:
-                name = self.engine.get_tensor_name(index)
-                is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-                dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(name)))
-                shape = tuple(int(v) for v in self.engine.get_tensor_shape(name))
-                profile = None
-                if is_input and -1 in shape:
-                    minimum, optimum, maximum = self.engine.get_tensor_profile_shape(name, 0)
-                    profile = ShapeProfile(
-                        minimum=tuple(int(v) for v in minimum),
-                        optimum=tuple(int(v) for v in optimum),
-                        maximum=tuple(int(v) for v in maximum),
-                    )
+        if self.uses_tensor_io_api:
+            self._binding_name = self.engine.get_tensor_name
+            self._binding_is_input = self._trt10_binding_is_input
+            self._binding_dtype = self._trt10_binding_dtype
+            self._binding_shape = self._trt10_binding_shape
+            self._binding_profile = self._trt10_binding_profile
+            self._set_context_shape = self.context.set_input_shape
+            self._get_context_shape = self.context.get_tensor_shape
+            if hasattr(self.context, "execute_async_v2"):
+                self._execute = self._execute_async
             else:
-                name = self.engine.get_binding_name(index)
-                is_input = self.engine.binding_is_input(index)
-                dtype = np.dtype(trt.nptype(self.engine.get_binding_dtype(index)))
-                shape = tuple(int(v) for v in self.engine.get_binding_shape(index))
-                profile = None
-                if is_input and -1 in shape:
-                    minimum, optimum, maximum = self.engine.get_profile_shape(0, index)
-                    profile = ShapeProfile(
-                        minimum=tuple(int(v) for v in minimum),
-                        optimum=tuple(int(v) for v in optimum),
-                        maximum=tuple(int(v) for v in maximum),
-                    )
+                self._execute = self._execute_sync
+        else:
+            self._binding_name = self.engine.get_binding_name
+            self._binding_is_input = self.engine.binding_is_input
+            self._binding_dtype = self._trt8_binding_dtype
+            self._binding_shape = self._trt8_binding_shape
+            self._binding_profile = self._trt8_binding_profile
+            self._set_context_shape = self._set_binding_shape
+            self._get_context_shape = self._get_binding_shape
+            if hasattr(self.context, "execute_async_v2"):
+                self._execute = self._execute_async
+            else:
+                self._execute = self._execute_sync
+
+        for index in range(self._binding_count):
+            name = self._binding_name(index)
+            is_input = self._binding_is_input(index)
+            dtype = self._binding_dtype(index)
+            shape = self._binding_shape(index)
+            profile = None
+            if is_input and -1 in shape:
+                minimum, optimum, maximum = self._binding_profile(index)
+                profile = ShapeProfile(
+                    minimum=tuple(int(v) for v in minimum),
+                    optimum=tuple(int(v) for v in optimum),
+                    maximum=tuple(int(v) for v in maximum),
+                )
             binding = TensorBinding(
                 name=name,
                 index=index,
@@ -114,16 +134,44 @@ class TensorRTRuntime:
             self.fp16,
         )
 
+    def _trt10_binding_is_input(self, index: int) -> bool:
+        return self.engine.get_tensor_mode(self.engine.get_tensor_name(index)) == self.trt.TensorIOMode.INPUT
+
+    def _trt10_binding_dtype(self, index: int) -> np.dtype:
+        return np.dtype(self.trt.nptype(self.engine.get_tensor_dtype(self.engine.get_tensor_name(index))))
+
+    def _trt10_binding_shape(self, index: int) -> tuple[int, ...]:
+        return tuple(int(v) for v in self.engine.get_tensor_shape(self.engine.get_tensor_name(index)))
+
+    def _trt10_binding_profile(self, index: int):
+        return self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(index), 0)
+
+    def _trt8_binding_dtype(self, index: int) -> np.dtype:
+        return np.dtype(self.trt.nptype(self.engine.get_binding_dtype(index)))
+
+    def _trt8_binding_shape(self, index: int) -> tuple[int, ...]:
+        return tuple(int(v) for v in self.engine.get_binding_shape(index))
+
+    def _trt8_binding_profile(self, index: int):
+        return self.engine.get_profile_shape(0, index)
+
+    def _set_binding_shape(self, name: str, shape: tuple[int, ...]) -> None:
+        self.context.set_binding_shape(self.bindings[name].index, shape)
+
+    def _get_binding_shape(self, name: str):
+        return self.context.get_binding_shape(self.bindings[name].index)
+
+    def _execute_async(self, binding_addrs: list[int], stream) -> bool:
+        return bool(self.context.execute_async_v2(binding_addrs, stream.cuda_stream))
+
+    def _execute_sync(self, binding_addrs: list[int], _stream) -> bool:
+        return bool(self.context.execute_v2(binding_addrs))
+
     def _set_input_shape(self, name: str, shape: tuple[int, ...]) -> None:
-        if self.is_trt10:
-            self.context.set_input_shape(name, shape)
-        else:
-            self.context.set_binding_shape(self.bindings[name].index, shape)
+        self._set_context_shape(name, shape)
 
     def _get_tensor_shape(self, name: str) -> tuple[int, ...]:
-        if self.is_trt10:
-            return tuple(int(v) for v in self.context.get_tensor_shape(name))
-        return tuple(int(v) for v in self.context.get_binding_shape(self.bindings[name].index))
+        return tuple(int(v) for v in self._get_context_shape(name))
 
     def _profile_shape(self, name: str) -> tuple[int, ...]:
         binding = self.bindings[name]
@@ -153,7 +201,7 @@ class TensorRTRuntime:
             tensors[name] = tensor
             self._set_input_shape(name, tuple(int(v) for v in tensor.shape))
 
-        if self.is_trt10 and hasattr(self.context, "infer_shapes"):
+        if self.uses_tensor_io_api and hasattr(self.context, "infer_shapes"):
             unresolved = self.context.infer_shapes()
             if unresolved:
                 raise RuntimeError(f"TensorRT could not infer all shapes: {unresolved}")
@@ -170,10 +218,7 @@ class TensorRTRuntime:
             binding_addrs.append(int(tensor.data_ptr()))
 
         stream = torch.cuda.current_stream(device=self.device)
-        if hasattr(self.context, "execute_async_v2"):
-            ok = self.context.execute_async_v2(binding_addrs, stream.cuda_stream)
-        else:
-            ok = self.context.execute_v2(binding_addrs)
+        ok = self._execute(binding_addrs, stream)
         if not ok:
             raise RuntimeError(f"TensorRT execution failed for '{self.engine_path}'")
         LOGGER.debug(

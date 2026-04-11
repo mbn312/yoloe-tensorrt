@@ -49,8 +49,14 @@ class _FakeEngine:
         self.metadata = SimpleNamespace(max_det=17)
         self.last_predict_kwargs: dict | None = None
 
-    def _predict_input_entry(self, **_kwargs) -> Results:
-        self.last_predict_kwargs = dict(_kwargs)
+    @property
+    def prompt_generation(self) -> int:
+        return int(self._prompt_generation)
+
+    def predict_item(self, _item, **kwargs) -> Results:
+        self.last_predict_kwargs = dict(kwargs)
+        if self.last_predict_kwargs.get("max_det") is None:
+            self.last_predict_kwargs["max_det"] = self.metadata.max_det
         index = min(self.predict_calls, len(self._results) - 1)
         self.predict_calls += 1
         return self._results[index]

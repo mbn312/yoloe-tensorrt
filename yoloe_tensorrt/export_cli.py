@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from ._cli_utils import parse_positive_int
 from .logging_utils import configure_logging
 
 
@@ -19,14 +20,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("onnx", "engine"),
         help="Artifact format to generate. Repeat to request multiple formats. Defaults to both.",
     )
-    parser.add_argument("--imgsz", type=int, default=640, help="Export image size. Defaults to 640.")
+    parser.add_argument(
+        "--imgsz",
+        type=lambda value: parse_positive_int(value, "--imgsz"),
+        default=640,
+        help="Export image size. Defaults to 640.",
+    )
     parser.add_argument("--dynamic", action="store_true", help="Enable dynamic image shapes.")
     parser.add_argument("--fixed", dest="dynamic", action="store_false", help="Disable dynamic image shapes.")
     parser.set_defaults(dynamic=True)
     parser.add_argument("--no-visual-engine", action="store_true", help="Skip the visual-prompt TensorRT engine build.")
     parser.add_argument("--no-fp16", action="store_true", help="Disable FP16 TensorRT builds.")
-    parser.add_argument("--max-det", type=int, default=300, help="Maximum detections baked into export metadata.")
-    parser.add_argument("--workspace-mb", type=int, default=2048, help="TensorRT builder workspace in MiB.")
+    parser.add_argument(
+        "--max-det",
+        type=lambda value: parse_positive_int(value, "--max-det"),
+        default=300,
+        help="Maximum detections baked into export metadata.",
+    )
+    parser.add_argument(
+        "--workspace-mb",
+        type=lambda value: parse_positive_int(value, "--workspace-mb"),
+        default=2048,
+        help="TensorRT builder workspace in MiB.",
+    )
     parser.add_argument(
         "--exporter",
         choices=("auto", "legacy", "dynamo"),
@@ -35,7 +51,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--opset-version",
-        type=int,
+        type=lambda value: parse_positive_int(value, "--opset-version"),
         help="Override the ONNX opset version. Defaults to 18 for dynamo and 17 for legacy.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing artifacts instead of resuming.")

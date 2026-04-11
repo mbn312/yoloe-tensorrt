@@ -44,6 +44,49 @@ class TrainingResult:
     exported_checkpoint_path: Path | None = None
 
 
+@dataclass(frozen=True)
+class _PostTrainExportRequest:
+    enabled: bool
+    checkpoint: ExportCheckpoint
+    artifact_dir: Path | None
+    formats: Iterable[str] | str
+    dynamic: bool
+    build_visual_engine: bool
+    fp16: bool
+    imgsz: int | tuple[int, int] | list[int] | None
+    max_det: int
+    overwrite: bool
+    workspace_bytes: int
+    onnx_exporter: OnnxExporterMode
+    onnx_opset_version: int | None
+
+
+@dataclass(frozen=True)
+class _TrainingRequest:
+    model_path: str
+    dataset_path: Path
+    task: DatasetTask
+    imgsz: int | tuple[int, int]
+    epochs: int
+    batch: int | float | str
+    device: Any
+    output_path: Path
+    name: str | None
+    overrides: dict[str, Any]
+    dataset: DatasetConfig | None
+    exist_ok: bool
+    export: _PostTrainExportRequest
+
+
+@dataclass(frozen=True)
+class _TrainingArtifacts:
+    run_dir: Path
+    checkpoint_path: Path
+    best_checkpoint_path: Path | None
+    last_checkpoint_path: Path | None
+    metrics_path: Path | None
+
+
 def train_model(
     model_checkpoint: str | Path,
     dataset_config: str | Path,
@@ -74,111 +117,216 @@ def train_model(
 ) -> TrainingResult:
     """Train or fine-tune a YOLOE checkpoint through Ultralytics and return run artifacts."""
 
-    if task not in _SUPPORTED_TRAINING_TASKS:
-        raise ValueError(f"Unsupported training task {task!r}; expected 'detect' or 'segment'.")
-    if export_checkpoint not in _SUPPORTED_EXPORT_CHECKPOINTS:
-        raise ValueError(f"Unsupported export checkpoint {export_checkpoint!r}; expected 'best' or 'last'.")
-
-    model_path = _normalize_model_checkpoint(model_checkpoint)
-    dataset_path = _normalize_dataset_config_path(dataset_config)
-    output_path = Path(output_dir).expanduser()
-    trainer_overrides = _normalize_overrides(overrides)
-    dataset = validate_dataset_config(dataset_path, task=task) if validate_dataset else None
-
-    train_kwargs: dict[str, Any] = {
-        "data": str(dataset_path),
-        "task": task,
-        "imgsz": imgsz,
-        "epochs": epochs,
-        "batch": batch,
-        "project": str(output_path),
-        "exist_ok": exist_ok,
-        **trainer_overrides,
-    }
-    if device is not None:
-        train_kwargs["device"] = device
-    if name is not None:
-        train_kwargs["name"] = name
-
-    yoloe_cls = _load_yoloe_class()
-    model = yoloe_cls(model_path, task=task)
-    metrics = model.train(**train_kwargs)
-    trainer = getattr(model, "trainer", None)
-    if trainer is None:
-        raise TrainingError("Ultralytics training did not expose a trainer with run artifacts.")
-
-    run_dir = _resolve_run_dir(trainer)
-    best_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "best")
-    last_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "last")
-    checkpoint_path = _resolve_primary_checkpoint_path(best_checkpoint_path, last_checkpoint_path, run_dir)
-    metrics_path = _resolve_metrics_path(run_dir)
-    metadata = _build_training_metadata(
-        model_checkpoint=model_path,
-        dataset_path=dataset_path,
-        dataset=dataset,
+    request = _build_training_request(
+        model_checkpoint=model_checkpoint,
+        dataset_config=dataset_config,
         task=task,
         imgsz=imgsz,
         epochs=epochs,
         batch=batch,
         device=device,
-        output_path=output_path,
+        output_dir=output_dir,
         name=name,
+        overrides=overrides,
+        validate_dataset=validate_dataset,
         exist_ok=exist_ok,
-        overrides=trainer_overrides,
+        export_artifact=export_artifact,
+        export_checkpoint=export_checkpoint,
+        export_artifact_dir=export_artifact_dir,
+        export_formats=export_formats,
+        export_dynamic=export_dynamic,
+        export_build_visual_engine=export_build_visual_engine,
+        export_fp16=export_fp16,
+        export_imgsz=export_imgsz,
+        export_max_det=export_max_det,
+        export_overwrite=export_overwrite,
+        export_workspace_bytes=export_workspace_bytes,
+        export_onnx_exporter=export_onnx_exporter,
+        export_onnx_opset_version=export_onnx_opset_version,
+    )
+    metrics, trainer = _run_training(request)
+    artifacts = _resolve_training_artifacts(trainer)
+    metadata = _build_training_metadata(
+        model_checkpoint=request.model_path,
+        dataset_path=request.dataset_path,
+        dataset=request.dataset,
+        task=request.task,
+        imgsz=request.imgsz,
+        epochs=request.epochs,
+        batch=request.batch,
+        device=request.device,
+        output_path=request.output_path,
+        name=request.name,
+        exist_ok=request.exist_ok,
+        overrides=request.overrides,
         metrics=metrics,
     )
-    artifact_dir: Path | None = None
-    exported_checkpoint_path: Path | None = None
-
-    if export_artifact:
-        from .export import export_model
-
-        exported_checkpoint_path = _select_export_checkpoint_path(
-            best_checkpoint_path=best_checkpoint_path,
-            last_checkpoint_path=last_checkpoint_path,
-            export_checkpoint=export_checkpoint,
-            run_dir=run_dir,
-        )
-        try:
-            artifact_dir = export_model(
-                exported_checkpoint_path,
-                artifact_dir=None if export_artifact_dir is None else Path(export_artifact_dir).expanduser(),
-                formats=export_formats,
-                dynamic=bool(export_dynamic),
-                build_visual_engine=bool(export_build_visual_engine),
-                fp16=bool(export_fp16),
-                imgsz=export_imgsz,
-                max_det=int(export_max_det),
-                overwrite=bool(export_overwrite),
-                workspace_bytes=int(export_workspace_bytes),
-                onnx_exporter=export_onnx_exporter,
-                onnx_opset_version=None if export_onnx_opset_version is None else int(export_onnx_opset_version),
-                training_metadata=_build_export_training_metadata(
-                    metadata=metadata,
-                    run_dir=run_dir,
-                    metrics_path=metrics_path,
-                    checkpoint_path=checkpoint_path,
-                    best_checkpoint_path=best_checkpoint_path,
-                    last_checkpoint_path=last_checkpoint_path,
-                    export_checkpoint=export_checkpoint,
-                    exported_checkpoint_path=exported_checkpoint_path,
-                ),
-            )
-        except Exception as exc:
-            raise TrainingError(
-                f"Training succeeded but export failed for checkpoint '{exported_checkpoint_path}': {exc}"
-            ) from exc
-
-    return TrainingResult(
-        checkpoint_path=checkpoint_path,
-        run_dir=run_dir,
-        metrics_path=metrics_path,
+    artifact_dir, exported_checkpoint_path = _export_training_artifact(
+        request=request,
+        artifacts=artifacts,
         metadata=metadata,
-        best_checkpoint_path=best_checkpoint_path,
-        last_checkpoint_path=last_checkpoint_path,
+    )
+    return TrainingResult(
+        checkpoint_path=artifacts.checkpoint_path,
+        run_dir=artifacts.run_dir,
+        metrics_path=artifacts.metrics_path,
+        metadata=metadata,
+        best_checkpoint_path=artifacts.best_checkpoint_path,
+        last_checkpoint_path=artifacts.last_checkpoint_path,
         artifact_dir=artifact_dir,
         exported_checkpoint_path=exported_checkpoint_path,
     )
+
+
+def _build_training_request(
+    *,
+    model_checkpoint: str | Path,
+    dataset_config: str | Path,
+    task: DatasetTask,
+    imgsz: int | tuple[int, int],
+    epochs: int,
+    batch: int | float | str,
+    device: Any,
+    output_dir: str | Path,
+    name: str | None,
+    overrides: Mapping[str, Any] | None,
+    validate_dataset: bool,
+    exist_ok: bool,
+    export_artifact: bool,
+    export_checkpoint: ExportCheckpoint,
+    export_artifact_dir: str | Path | None,
+    export_formats: Iterable[str] | str,
+    export_dynamic: bool,
+    export_build_visual_engine: bool,
+    export_fp16: bool,
+    export_imgsz: int | tuple[int, int] | list[int] | None,
+    export_max_det: int,
+    export_overwrite: bool,
+    export_workspace_bytes: int,
+    export_onnx_exporter: OnnxExporterMode,
+    export_onnx_opset_version: int | None,
+) -> _TrainingRequest:
+    if task not in _SUPPORTED_TRAINING_TASKS:
+        raise ValueError(f"Unsupported training task {task!r}; expected 'detect' or 'segment'.")
+    if export_checkpoint not in _SUPPORTED_EXPORT_CHECKPOINTS:
+        raise ValueError(f"Unsupported export checkpoint {export_checkpoint!r}; expected 'best' or 'last'.")
+    dataset_path = _normalize_dataset_config_path(dataset_config)
+    return _TrainingRequest(
+        model_path=_normalize_model_checkpoint(model_checkpoint),
+        dataset_path=dataset_path,
+        task=task,
+        imgsz=imgsz,
+        epochs=epochs,
+        batch=batch,
+        device=device,
+        output_path=Path(output_dir).expanduser(),
+        name=name,
+        overrides=_normalize_overrides(overrides),
+        dataset=validate_dataset_config(dataset_path, task=task) if validate_dataset else None,
+        exist_ok=exist_ok,
+        export=_PostTrainExportRequest(
+            enabled=bool(export_artifact),
+            checkpoint=export_checkpoint,
+            artifact_dir=None if export_artifact_dir is None else Path(export_artifact_dir).expanduser(),
+            formats=export_formats,
+            dynamic=bool(export_dynamic),
+            build_visual_engine=bool(export_build_visual_engine),
+            fp16=bool(export_fp16),
+            imgsz=export_imgsz,
+            max_det=int(export_max_det),
+            overwrite=bool(export_overwrite),
+            workspace_bytes=int(export_workspace_bytes),
+            onnx_exporter=export_onnx_exporter,
+            onnx_opset_version=None if export_onnx_opset_version is None else int(export_onnx_opset_version),
+        ),
+    )
+
+
+def _run_training(request: _TrainingRequest) -> tuple[Any, Any]:
+    train_kwargs: dict[str, Any] = {
+        "data": str(request.dataset_path),
+        "task": request.task,
+        "imgsz": request.imgsz,
+        "epochs": request.epochs,
+        "batch": request.batch,
+        "project": str(request.output_path),
+        "exist_ok": request.exist_ok,
+        **request.overrides,
+    }
+    if request.device is not None:
+        train_kwargs["device"] = request.device
+    if request.name is not None:
+        train_kwargs["name"] = request.name
+
+    yoloe_cls = _load_yoloe_class()
+    model = yoloe_cls(request.model_path, task=request.task)
+    metrics = model.train(**train_kwargs)
+    trainer = getattr(model, "trainer", None)
+    if trainer is None:
+        raise TrainingError("Ultralytics training did not expose a trainer with run artifacts.")
+    return metrics, trainer
+
+
+def _resolve_training_artifacts(trainer: Any) -> _TrainingArtifacts:
+    run_dir = _resolve_run_dir(trainer)
+    best_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "best")
+    last_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "last")
+    return _TrainingArtifacts(
+        run_dir=run_dir,
+        checkpoint_path=_resolve_primary_checkpoint_path(best_checkpoint_path, last_checkpoint_path, run_dir),
+        best_checkpoint_path=best_checkpoint_path,
+        last_checkpoint_path=last_checkpoint_path,
+        metrics_path=_resolve_metrics_path(run_dir),
+    )
+
+
+def _export_training_artifact(
+    *,
+    request: _TrainingRequest,
+    artifacts: _TrainingArtifacts,
+    metadata: Mapping[str, Any],
+) -> tuple[Path | None, Path | None]:
+    if not request.export.enabled:
+        return None, None
+
+    exported_checkpoint_path = _select_export_checkpoint_path(
+        best_checkpoint_path=artifacts.best_checkpoint_path,
+        last_checkpoint_path=artifacts.last_checkpoint_path,
+        export_checkpoint=request.export.checkpoint,
+        run_dir=artifacts.run_dir,
+    )
+    try:
+        from .export import export_model
+
+        artifact_dir = export_model(
+            exported_checkpoint_path,
+            artifact_dir=request.export.artifact_dir,
+            formats=request.export.formats,
+            dynamic=request.export.dynamic,
+            build_visual_engine=request.export.build_visual_engine,
+            fp16=request.export.fp16,
+            imgsz=request.export.imgsz,
+            max_det=request.export.max_det,
+            overwrite=request.export.overwrite,
+            workspace_bytes=request.export.workspace_bytes,
+            onnx_exporter=request.export.onnx_exporter,
+            onnx_opset_version=request.export.onnx_opset_version,
+            training_metadata=_build_export_training_metadata(
+                metadata=metadata,
+                run_dir=artifacts.run_dir,
+                metrics_path=artifacts.metrics_path,
+                checkpoint_path=artifacts.checkpoint_path,
+                best_checkpoint_path=artifacts.best_checkpoint_path,
+                last_checkpoint_path=artifacts.last_checkpoint_path,
+                export_checkpoint=request.export.checkpoint,
+                exported_checkpoint_path=exported_checkpoint_path,
+            ),
+        )
+    except Exception as exc:
+        raise TrainingError(
+            f"Training succeeded but export failed for checkpoint '{exported_checkpoint_path}': {exc}"
+        ) from exc
+    return artifact_dir, exported_checkpoint_path
 
 
 def _load_yoloe_class() -> Any:

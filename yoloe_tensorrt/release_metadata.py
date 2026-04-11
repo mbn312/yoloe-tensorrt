@@ -4,7 +4,12 @@ import argparse
 import re
 from pathlib import Path
 
-PROJECT_VERSION_PATTERN = re.compile(r'^version\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+try:
+    from tomllib import TOMLDecodeError
+except ModuleNotFoundError:  # pragma: no cover
+    from tomli import TOMLDecodeError
+
+from ._project_metadata import load_project_version as _load_project_version
 
 
 def normalize_expected_version(value: str | None) -> str | None:
@@ -19,11 +24,10 @@ def normalize_expected_version(value: str | None) -> str | None:
 
 
 def load_project_version(pyproject_path: str | Path) -> str:
-    content = Path(pyproject_path).read_text()
-    match = PROJECT_VERSION_PATTERN.search(content)
-    if match is None:
-        raise ValueError(f"Unable to find a project version in '{pyproject_path}'")
-    return match.group(1)
+    try:
+        return _load_project_version(pyproject_path)
+    except TOMLDecodeError as exc:
+        raise ValueError(f"Unable to parse project metadata from '{pyproject_path}'") from exc
 
 
 def changelog_has_version(changelog_path: str | Path, version: str) -> bool:

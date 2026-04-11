@@ -75,6 +75,18 @@ def _load_path(path: str | Path) -> SourceItem:
     return SourceItem(image=_normalize_array(image), path=resolved)
 
 
+def source_item_from_value(source: object, *, path: str) -> SourceItem:
+    if isinstance(source, SourceItem):
+        return source
+    if isinstance(source, (str, Path)):
+        return _load_path(source)
+    if isinstance(source, Image.Image):
+        return SourceItem(image=_pil_to_bgr(source), path=path)
+    if isinstance(source, np.ndarray):
+        return SourceItem(image=_normalize_array(source), path=path)
+    raise TypeError(f"Unsupported source item type: {type(source)!r}")
+
+
 def _is_iterable_source(source: object) -> bool:
     return hasattr(source, "__iter__") and not isinstance(source, (str, bytes, Path, np.ndarray, Image.Image))
 
@@ -103,23 +115,14 @@ def iter_sources(source: object, default_prefix: str = "image") -> Iterator[Sour
         yield _load_path(source)
         return
     if isinstance(source, Image.Image):
-        yield SourceItem(image=_pil_to_bgr(source), path=f"{default_prefix}0")
+        yield source_item_from_value(source, path=f"{default_prefix}0")
         return
     if isinstance(source, np.ndarray):
-        yield SourceItem(image=_normalize_array(source), path=f"{default_prefix}0")
+        yield source_item_from_value(source, path=f"{default_prefix}0")
         return
     if _is_iterable_source(source):
         for index, item in enumerate(source):
-            if isinstance(item, SourceItem):
-                yield item
-            elif isinstance(item, (str, Path)):
-                yield _load_path(item)
-            elif isinstance(item, Image.Image):
-                yield SourceItem(image=_pil_to_bgr(item), path=f"{default_prefix}{index}")
-            elif isinstance(item, np.ndarray):
-                yield SourceItem(image=_normalize_array(item), path=f"{default_prefix}{index}")
-            else:
-                raise TypeError(f"Unsupported source item type: {type(item)!r}")
+            yield source_item_from_value(item, path=f"{default_prefix}{index}")
         return
     raise TypeError(f"Unsupported source type: {type(source)!r}")
 

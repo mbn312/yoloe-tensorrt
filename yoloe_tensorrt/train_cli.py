@@ -5,8 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from ._cli_utils import load_yaml_value, parse_imgsz, parse_key_value_args, parse_positive_int
 from .datasets import DatasetValidationError
 from .logging_utils import configure_logging
 from .training import TrainingError, TrainingResult, train_model
@@ -23,7 +22,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", choices=("detect", "segment"), default="detect", help="Training task.")
     parser.add_argument(
         "--imgsz",
-        type=_parse_imgsz,
+        type=lambda value: parse_imgsz(value, "--imgsz"),
         default=640,
         metavar="N|HxW",
         help="Image size. Use one value for square training or HxW/H,W for rectangular training. Defaults to 640.",
@@ -116,19 +115,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     export_group.add_argument(
         "--export-imgsz",
-        type=lambda value: _parse_positive_int(value, "--export-imgsz"),
+        type=lambda value: parse_positive_int(value, "--export-imgsz"),
         default=None,
         help="Export image size. Defaults to the export_model(...) behavior when omitted.",
     )
     export_group.add_argument(
         "--export-max-det",
-        type=lambda value: _parse_positive_int(value, "--export-max-det"),
+        type=lambda value: parse_positive_int(value, "--export-max-det"),
         default=None,
         help="Maximum detections baked into export metadata. Defaults to 300.",
     )
     export_group.add_argument(
         "--export-workspace-mb",
-        type=lambda value: _parse_positive_int(value, "--export-workspace-mb"),
+        type=lambda value: parse_positive_int(value, "--export-workspace-mb"),
         default=None,
         help="TensorRT builder workspace in MiB for post-training export. Defaults to 2048.",
     )
@@ -140,7 +139,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     export_group.add_argument(
         "--export-opset-version",
-        type=lambda value: _parse_positive_int(value, "--export-opset-version"),
+        type=lambda value: parse_positive_int(value, "--export-opset-version"),
         default=None,
         help="Override the ONNX opset version used for post-training export.",
     )
@@ -224,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _parse_batch(value: str) -> int | float | str:
-    parsed = _load_yaml_value(value)
+    parsed = load_yaml_value(value)
     if isinstance(parsed, bool) or parsed is None or isinstance(parsed, list | dict):
         raise argparse.ArgumentTypeError("--batch must be an integer, float, or string such as auto.")
     if not isinstance(parsed, int | float | str):
@@ -251,55 +250,8 @@ def _has_export_options(args: argparse.Namespace) -> bool:
     )
 
 
-def _parse_imgsz(value: str) -> int | tuple[int, int]:
-    raw_value = value.strip().lower()
-    if not raw_value:
-        raise argparse.ArgumentTypeError("--imgsz must not be empty.")
-
-    for separator in ("x", ","):
-        if separator in raw_value:
-            parts = [part.strip() for part in raw_value.split(separator)]
-            if len(parts) != 2 or not all(parts):
-                raise argparse.ArgumentTypeError("--imgsz must be one integer or two integers as HxW or H,W.")
-            height, width = (_parse_positive_int(part, "--imgsz") for part in parts)
-            return (height, width)
-
-    return _parse_positive_int(raw_value, "--imgsz")
-
-
-def _parse_positive_int(value: str, option_name: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"{option_name} must contain integer value(s).") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError(f"{option_name} must be greater than zero.")
-    return parsed
-
-
 def _parse_ultralytics_args(entries: list[str] | None) -> dict[str, Any]:
-    overrides: dict[str, Any] = {}
-    for entry in entries or []:
-        if "=" not in entry:
-            raise _CliArgumentError("--ultralytics-arg must use KEY=VALUE syntax.")
-        key, raw_value = entry.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise _CliArgumentError("--ultralytics-arg keys must not be empty.")
-        if key in overrides:
-            raise _CliArgumentError(f"--ultralytics-arg key {key!r} was provided more than once.")
-        try:
-            overrides[key] = "" if raw_value == "" else _load_yaml_value(raw_value)
-        except argparse.ArgumentTypeError as exc:
-            raise _CliArgumentError(str(exc)) from exc
-    return overrides
-
-
-def _load_yaml_value(value: str) -> Any:
-    try:
-        return yaml.safe_load(value)
-    except yaml.YAMLError as exc:
-        raise argparse.ArgumentTypeError(f"could not parse YAML scalar {value!r}: {exc}") from exc
+    return parse_key_value_args(entries, option_name="--ultralytics-arg", error_type=_CliArgumentError)
 
 
 def _print_result(result: TrainingResult) -> None:
