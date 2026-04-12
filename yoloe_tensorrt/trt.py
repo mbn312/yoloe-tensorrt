@@ -240,6 +240,21 @@ class TensorRTRuntime:
         LOGGER.info("Warmup complete for '%s'", self.engine_path.name)
 
 
+def _parse_onnx_network(parser: object, onnx_path: Path) -> bool:
+    parse_from_file = getattr(parser, "parse_from_file", None)
+    if callable(parse_from_file):
+        return bool(parse_from_file(str(onnx_path)))
+
+    previous_cwd = Path.cwd()
+    try:
+        # Older TensorRT Python bindings may only expose parse(bytes); switch to the
+        # model directory first so relative external-data paths still resolve.
+        os.chdir(onnx_path.parent)
+        return bool(parser.parse(onnx_path.read_bytes()))
+    finally:
+        os.chdir(previous_cwd)
+
+
 def build_engine_from_onnx(
     onnx_path: str | Path,
     engine_path: str | Path,
@@ -252,6 +267,8 @@ def build_engine_from_onnx(
     except ImportError as exc:
         raise RuntimeError("TensorRT is required to build an engine") from exc
 
+    onnx_path = Path(onnx_path).resolve()
+    engine_path = Path(engine_path)
     LOGGER.info(
         "Building TensorRT engine '%s' from ONNX '%s' (fp16=%s, workspace_bytes=%d)",
         engine_path,
@@ -263,7 +280,7 @@ def build_engine_from_onnx(
     builder = trt.Builder(logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, logger)
-    if not parser.parse(Path(onnx_path).read_bytes()):
+    if not _parse_onnx_network(parser, onnx_path):
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
         raise RuntimeError(f"Failed to parse ONNX model '{onnx_path}':\n{errors}")
 
@@ -302,7 +319,7 @@ def build_engine_from_onnx(
     if serialized is None:
         raise RuntimeError(f"TensorRT failed to build engine from '{onnx_path}'")
 
-    output_path = Path(engine_path)
+    output_path = engine_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(bytes(serialized))
     LOGGER.info("Finished building TensorRT engine '%s'", output_path)
