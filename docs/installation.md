@@ -14,6 +14,24 @@ Install these before the Python package:
 - OpenCV
 - GStreamer for live camera input
 
+`pip install tensorrt` is not enough for the native build by itself. The package builds a native C++ extension and needs
+the TensorRT C++ SDK headers such as `NvInfer.h`, so you still need a full TensorRT development install or an explicit
+`TENSORRT_ROOT` that points at one.
+
+On Debian/Ubuntu systems with NVIDIA's TensorRT apt repository configured, a common fix is:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libnvinfer-dev libnvinfer10
+```
+
+The runtime package name is TensorRT-major-version specific. For example, older stacks may use `libnvinfer8` instead of
+`libnvinfer10`. If the exact package name differs on your system, check:
+
+```bash
+apt-cache search libnvinfer
+```
+
 ## Install from git
 
 ```bash

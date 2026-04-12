@@ -14,11 +14,30 @@ If editable installation fails during CMake configuration:
 - make sure `python -m pybind11 --cmakedir` works in the same environment you are using for `pip install`
 - if OpenCV is installed under `/usr/local`, make sure `pkg-config --cflags opencv4` works
 - if TensorRT is installed in a non-standard prefix, set `TENSORRT_ROOT=/path/to/TensorRT` before installing
+- `pip install tensorrt` alone is not enough for the native build because the native extension also needs the TensorRT
+  C++ headers such as `NvInfer.h`
+- on Debian/Ubuntu with NVIDIA's TensorRT apt repository configured, a common recovery path is:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libnvinfer-dev libnvinfer10
+```
+
+  If your stack is on an older TensorRT major, the runtime package may be versioned differently, such as `libnvinfer8`.
+  Use `apt-cache search libnvinfer` if needed.
 - if you are using `--no-build-isolation`, install the build backend into that environment first:
 
 ```bash
 python -m pip install scikit-build-core pybind11 cmake ninja
 ```
+
+On non-Jetson x86_64 systems, this warning is expected and not the cause of the build failure:
+
+```text
+Jetson zero-copy camera backend dependencies not found; building without camera backend
+```
+
+The Jetson camera backend is optional and only builds when Jetson-specific multimedia dependencies are present.
 
 ## Runtime falls back to Python
 

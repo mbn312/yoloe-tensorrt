@@ -45,10 +45,210 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
 
+set(CUDA_HEADER_HINT_DIRS
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIR}
+  $ENV{CUDA_PATH}
+  $ENV{CUDA_HOME}
+  /usr/local/cuda
+  /usr/local/cuda-${CUDAToolkit_VERSION}
+)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c
+          "import importlib.util, pathlib, sysconfig; candidates = []; \
+seen = set(); \
+def add(path): \
+    if not path: return; \
+    resolved = pathlib.Path(path).resolve(); \
+    text = str(resolved); \
+    if resolved.exists() and text not in seen: \
+        seen.add(text); candidates.append(text); \
+for key in ('platlib', 'purelib'): \
+    base = sysconfig.get_paths().get(key); \
+    if not base: continue; \
+    root = pathlib.Path(base); \
+    for relative in ('nvidia/cuda_runtime/include', 'nvidia/cu13/include', 'triton/backends/nvidia/include'): \
+        add(root / relative); \
+for name in ('nvidia.cuda_runtime', 'nvidia.cu13', 'triton.backends.nvidia'): \
+    spec = importlib.util.find_spec(name); \
+    if spec is None: continue; \
+    if spec.submodule_search_locations: \
+        for location in spec.submodule_search_locations: \
+            add(location); add(pathlib.Path(location) / 'include'); \
+    elif spec.origin: \
+        location = pathlib.Path(spec.origin).parent; \
+        add(location); add(location / 'include'); \
+print('\\n'.join(candidates))"
+  OUTPUT_VARIABLE CUDA_PYTHON_HEADER_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE CUDA_PYTHON_HEADER_HINTS_STATUS
+)
+if(CUDA_PYTHON_HEADER_HINTS_STATUS EQUAL 0 AND CUDA_PYTHON_HEADER_HINTS)
+  string(REPLACE "\n" ";" CUDA_PYTHON_HEADER_HINTS "${CUDA_PYTHON_HEADER_HINTS}")
+  list(APPEND CUDA_HEADER_HINT_DIRS ${CUDA_PYTHON_HEADER_HINTS})
+endif()
+list(REMOVE_DUPLICATES CUDA_HEADER_HINT_DIRS)
+
+find_path(
+  CUDA_RUNTIME_INCLUDE_DIR
+  cuda_fp16.h
+  HINTS
+    ${CUDA_HEADER_HINT_DIRS}
+  PATH_SUFFIXES
+    .
+    include
+    include/${CMAKE_LIBRARY_ARCHITECTURE}
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/include
+)
+
+if(NOT CUDA_RUNTIME_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "Could not find CUDA runtime headers (missing cuda_fp16.h). "
+    "Install the CUDA Toolkit headers or a compatible Python CUDA runtime package in the active environment."
+  )
+endif()
+
+set(CUDA_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+list(APPEND CUDA_INCLUDE_DIRS "${CUDA_RUNTIME_INCLUDE_DIR}")
+list(REMOVE_DUPLICATES CUDA_INCLUDE_DIRS)
+
+set(CUDA_LIBRARY_HINT_DIRS
+  ${CUDAToolkit_LIBRARY_DIR}
+  ${CUDAToolkit_LIBRARY_ROOT}
+  $ENV{CUDA_PATH}
+  $ENV{CUDA_HOME}
+  /usr
+  /usr/local
+  /usr/local/cuda
+  /usr/local/cuda-${CUDAToolkit_VERSION}
+)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c
+          "import importlib.util, pathlib, sysconfig; candidates = []; \
+seen = set(); \
+def add(path): \
+    if not path: return; \
+    resolved = pathlib.Path(path).resolve(); \
+    text = str(resolved); \
+    if resolved.exists() and text not in seen: \
+        seen.add(text); candidates.append(text); \
+for key in ('platlib', 'purelib'): \
+    base = sysconfig.get_paths().get(key); \
+    if not base: continue; \
+    root = pathlib.Path(base); \
+    for relative in ('nvidia/cu13/lib', 'nvidia/cuda_runtime/lib', 'nvidia/cuda_runtime/lib64'): \
+        add(root / relative); \
+for name in ('nvidia.cu13', 'nvidia.cuda_runtime'): \
+    spec = importlib.util.find_spec(name); \
+    if spec is None: continue; \
+    if spec.submodule_search_locations: \
+        for location in spec.submodule_search_locations: \
+            add(location); add(pathlib.Path(location) / 'lib'); add(pathlib.Path(location) / 'lib64'); \
+    elif spec.origin: \
+        location = pathlib.Path(spec.origin).parent; \
+        add(location); add(location / 'lib'); add(location / 'lib64'); \
+print('\\n'.join(candidates))"
+  OUTPUT_VARIABLE CUDA_PYTHON_LIBRARY_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE CUDA_PYTHON_LIBRARY_HINTS_STATUS
+)
+if(CUDA_PYTHON_LIBRARY_HINTS_STATUS EQUAL 0 AND CUDA_PYTHON_LIBRARY_HINTS)
+  string(REPLACE "\n" ";" CUDA_PYTHON_LIBRARY_HINTS "${CUDA_PYTHON_LIBRARY_HINTS}")
+  list(APPEND CUDA_LIBRARY_HINT_DIRS ${CUDA_PYTHON_LIBRARY_HINTS})
+endif()
+list(REMOVE_DUPLICATES CUDA_LIBRARY_HINT_DIRS)
+
+find_library(
+  CUDA_DEVICE_RUNTIME_LIBRARY
+  cudadevrt
+  HINTS
+    ${CUDA_LIBRARY_HINT_DIRS}
+  PATH_SUFFIXES
+    .
+    lib
+    lib64
+    lib/${CMAKE_LIBRARY_ARCHITECTURE}
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/lib
+)
+
+find_library(
+  CUDA_RUNTIME_SHARED_LIBRARY
+  cudart
+  HINTS
+    ${CUDA_LIBRARY_HINT_DIRS}
+  PATH_SUFFIXES
+    .
+    lib
+    lib64
+    lib/${CMAKE_LIBRARY_ARCHITECTURE}
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/lib
+)
+
+set(CUDA_LINK_DIRECTORIES "")
+foreach(cuda_runtime_lib IN ITEMS "${CUDA_DEVICE_RUNTIME_LIBRARY}" "${CUDA_RUNTIME_SHARED_LIBRARY}")
+  if(cuda_runtime_lib)
+    get_filename_component(cuda_runtime_lib_dir "${cuda_runtime_lib}" DIRECTORY)
+    list(APPEND CUDA_LINK_DIRECTORIES "${cuda_runtime_lib_dir}")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES CUDA_LINK_DIRECTORIES)
+
+set(CUDA_LINK_OPTIONS "")
+foreach(cuda_link_dir IN LISTS CUDA_LINK_DIRECTORIES)
+  list(APPEND CUDA_LINK_OPTIONS "-L${cuda_link_dir}")
+  list(APPEND CUDA_LINK_OPTIONS "-Wl,-rpath-link,${cuda_link_dir}")
+endforeach()
+
+set(TENSORRT_HINT_DIRS
+  $ENV{TENSORRT_ROOT}
+  $ENV{TensorRT_ROOT}
+  /usr
+  /usr/local
+  /opt
+  /opt/TensorRT
+  /usr/src/tensorrt
+)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c
+          "import importlib.util, pathlib, site, sysconfig; candidates = []; \
+modules = ('tensorrt', 'tensorrt_libs', 'tensorrt_lean', 'tensorrt_dispatch', 'tensorrt_bindings'); \
+seen = set(); \
+def add(path): \
+    if not path: return; \
+    text = str(pathlib.Path(path).resolve()); \
+    if text not in seen and pathlib.Path(text).exists(): \
+        seen.add(text); candidates.append(text); \
+for key in ('platlib', 'purelib'): add(sysconfig.get_paths().get(key)); \
+for path in site.getsitepackages(): add(path); \
+add(site.getusersitepackages()); \
+for name in modules: \
+    spec = importlib.util.find_spec(name); \
+    if spec is None: continue; \
+    if spec.submodule_search_locations: \
+        [add(location) for location in spec.submodule_search_locations]; \
+    elif spec.origin: add(pathlib.Path(spec.origin).parent); \
+print('\\n'.join(candidates))"
+  OUTPUT_VARIABLE TENSORRT_PYTHON_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE TENSORRT_PYTHON_HINTS_STATUS
+)
+if(TENSORRT_PYTHON_HINTS_STATUS EQUAL 0 AND TENSORRT_PYTHON_HINTS)
+  string(REPLACE "\n" ";" TENSORRT_PYTHON_HINTS "${TENSORRT_PYTHON_HINTS}")
+  list(APPEND TENSORRT_HINT_DIRS ${TENSORRT_PYTHON_HINTS})
+endif()
+list(REMOVE_DUPLICATES TENSORRT_HINT_DIRS)
+
 set(HAVE_CUDA_COMPILER OFF)
 if(YOLOE_TRT_BUILD_CUDA_PREPROCESS OR YOLOE_TRT_BUILD_JETSON_CAMERA)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
     enable_language(CUDA)
     set(HAVE_CUDA_COMPILER ON)
   endif()
@@ -68,19 +268,25 @@ find_library(
   TENSORRT_LIBRARY
   nvinfer
   HINTS
-    $ENV{TENSORRT_ROOT}
-    $ENV{TensorRT_ROOT}
-    /usr
-    /usr/local
-    /opt
-    /opt/TensorRT
-    /usr/src/tensorrt
+    ${TENSORRT_HINT_DIRS}
   PATH_SUFFIXES
+    .
     lib
+    libs
     lib64
     lib/${CMAKE_LIBRARY_ARCHITECTURE}
-  REQUIRED
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/lib
 )
+
+if(NOT TENSORRT_LIBRARY)
+  message(FATAL_ERROR
+    "Could not find the TensorRT C++ library 'nvinfer'. "
+    "This project builds a native TensorRT extension and needs the native runtime library to be discoverable by CMake. "
+    "Set TENSORRT_ROOT to your TensorRT install prefix if it is not under a standard system location. "
+    "If you only installed TensorRT with `pip install tensorrt`, note that the Python package layout may differ from a system SDK install and may still be insufficient for native C++ builds. "
+    "On Debian/Ubuntu with NVIDIA's TensorRT apt repository configured, a common fix is `sudo apt-get update && sudo apt-get install -y libnvinfer-dev` plus the matching runtime package for your TensorRT major version, for example `libnvinfer10` on TensorRT 10.x."
+  )
+endif()
 
 get_filename_component(TENSORRT_LIBRARY_DIR "${TENSORRT_LIBRARY}" DIRECTORY)
 get_filename_component(TENSORRT_LIBRARY_PREFIX "${TENSORRT_LIBRARY_DIR}" DIRECTORY)
@@ -89,24 +295,32 @@ find_path(
   TENSORRT_INCLUDE_DIR
   NvInfer.h
   HINTS
-    $ENV{TENSORRT_ROOT}
-    $ENV{TensorRT_ROOT}
+    ${TENSORRT_HINT_DIRS}
     "${TENSORRT_LIBRARY_DIR}"
     "${TENSORRT_LIBRARY_PREFIX}"
-    /usr
-    /usr/local
-    /opt
-    /opt/TensorRT
-    /usr/src/tensorrt
   PATH_SUFFIXES
+    .
     include
+    includes
     include/${CMAKE_LIBRARY_ARCHITECTURE}
     ${CMAKE_LIBRARY_ARCHITECTURE}
-  REQUIRED
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/include
 )
+
+if(NOT TENSORRT_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "Could not find TensorRT C++ headers (missing NvInfer.h). "
+    "This native extension needs the TensorRT development headers. NVIDIA's TensorRT pip installation does not include the C++ headers, so `pip install tensorrt` alone is not enough to build this package natively. "
+    "Install the TensorRT development package/tarball or set TENSORRT_ROOT to a full TensorRT SDK install. "
+    "On Debian/Ubuntu with NVIDIA's TensorRT apt repository configured, a common fix is `sudo apt-get update && sudo apt-get install -y libnvinfer-dev` plus the matching runtime package for your TensorRT major version, for example `libnvinfer10` on TensorRT 10.x. "
+    "If you only need docs or lightweight non-native workflows, install with `--config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF`."
+  )
+endif()
 
 message(STATUS "Found TensorRT include dir: ${TENSORRT_INCLUDE_DIR}")
 message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
+message(STATUS "Found CUDA include dirs: ${CUDA_INCLUDE_DIRS}")
+message(STATUS "Found CUDA link dirs: ${CUDA_LINK_DIRECTORIES}")
 
 set(NATIVE_SOURCES src/native/main.cpp)
 set(NATIVE_EXTRA_LIBS "")
@@ -174,9 +388,20 @@ endif()
 
 pybind11_add_module(_native MODULE ${NATIVE_SOURCES})
 
+target_link_options(
+  _native
+  PRIVATE
+    ${CUDA_LINK_OPTIONS}
+)
+
 target_include_directories(
   _native
   PRIVATE
+<<<<<<< Updated upstream
+    ${CUDAToolkit_INCLUDE_DIRS}
+=======
+    ${CUDA_INCLUDE_DIRS}
+>>>>>>> Stashed changes
     ${TENSORRT_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native
     ${OpenCV_INCLUDE_DIRS}
@@ -196,7 +421,13 @@ target_compile_definitions(_native PRIVATE PY_SSIZE_T_CLEAN=1)
 target_compile_definitions(_native PRIVATE ${NATIVE_EXTRA_COMPILE_DEFINITIONS})
 
 if(TARGET _native AND CMAKE_CUDA_COMPILER)
-  set_target_properties(_native PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
+  set_target_properties(
+    _native
+    PROPERTIES
+      CUDA_RUNTIME_LIBRARY Shared
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED YES
+  )
 endif()
 
 install(TARGETS _native DESTINATION yoloe_tensorrt)
