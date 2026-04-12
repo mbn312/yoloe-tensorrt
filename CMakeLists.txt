@@ -45,6 +45,47 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
 
+set(TENSORRT_HINT_DIRS
+  $ENV{TENSORRT_ROOT}
+  $ENV{TensorRT_ROOT}
+  /usr
+  /usr/local
+  /opt
+  /opt/TensorRT
+  /usr/src/tensorrt
+)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c
+          "import importlib.util, pathlib, site, sysconfig; candidates = []; \
+modules = ('tensorrt', 'tensorrt_libs', 'tensorrt_lean', 'tensorrt_dispatch', 'tensorrt_bindings'); \
+seen = set(); \
+def add(path): \
+    if not path: return; \
+    text = str(pathlib.Path(path).resolve()); \
+    if text not in seen and pathlib.Path(text).exists(): \
+        seen.add(text); candidates.append(text); \
+for key in ('platlib', 'purelib'): add(sysconfig.get_paths().get(key)); \
+for path in site.getsitepackages(): add(path); \
+add(site.getusersitepackages()); \
+for name in modules: \
+    spec = importlib.util.find_spec(name); \
+    if spec is None: continue; \
+    if spec.submodule_search_locations: \
+        [add(location) for location in spec.submodule_search_locations]; \
+    elif spec.origin: add(pathlib.Path(spec.origin).parent); \
+print('\\n'.join(candidates))"
+  OUTPUT_VARIABLE TENSORRT_PYTHON_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE TENSORRT_PYTHON_HINTS_STATUS
+)
+if(TENSORRT_PYTHON_HINTS_STATUS EQUAL 0 AND TENSORRT_PYTHON_HINTS)
+  string(REPLACE "\n" ";" TENSORRT_PYTHON_HINTS "${TENSORRT_PYTHON_HINTS}")
+  list(APPEND TENSORRT_HINT_DIRS ${TENSORRT_PYTHON_HINTS})
+endif()
+list(REMOVE_DUPLICATES TENSORRT_HINT_DIRS)
+
 set(HAVE_CUDA_COMPILER OFF)
 if(YOLOE_TRT_BUILD_CUDA_PREPROCESS OR YOLOE_TRT_BUILD_JETSON_CAMERA)
   check_language(CUDA)
@@ -68,19 +109,25 @@ find_library(
   TENSORRT_LIBRARY
   nvinfer
   HINTS
-    $ENV{TENSORRT_ROOT}
-    $ENV{TensorRT_ROOT}
-    /usr
-    /usr/local
-    /opt
-    /opt/TensorRT
-    /usr/src/tensorrt
+    ${TENSORRT_HINT_DIRS}
   PATH_SUFFIXES
+    .
     lib
+    libs
     lib64
     lib/${CMAKE_LIBRARY_ARCHITECTURE}
-  REQUIRED
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/lib
 )
+
+if(NOT TENSORRT_LIBRARY)
+  message(FATAL_ERROR
+    "Could not find the TensorRT C++ library 'nvinfer'. "
+    "This project builds a native TensorRT extension and needs the native runtime library to be discoverable by CMake. "
+    "Set TENSORRT_ROOT to your TensorRT install prefix if it is not under a standard system location. "
+    "If you only installed TensorRT with `pip install tensorrt`, note that the Python package layout may differ from a system SDK install and may still be insufficient for native C++ builds. "
+    "On Debian/Ubuntu with NVIDIA's TensorRT apt repository configured, a common fix is `sudo apt-get update && sudo apt-get install -y libnvinfer-dev` plus the matching runtime package for your TensorRT major version, for example `libnvinfer10` on TensorRT 10.x."
+  )
+endif()
 
 get_filename_component(TENSORRT_LIBRARY_DIR "${TENSORRT_LIBRARY}" DIRECTORY)
 get_filename_component(TENSORRT_LIBRARY_PREFIX "${TENSORRT_LIBRARY_DIR}" DIRECTORY)
@@ -89,24 +136,31 @@ find_path(
   TENSORRT_INCLUDE_DIR
   NvInfer.h
   HINTS
-    $ENV{TENSORRT_ROOT}
-    $ENV{TensorRT_ROOT}
+    ${TENSORRT_HINT_DIRS}
     "${TENSORRT_LIBRARY_DIR}"
     "${TENSORRT_LIBRARY_PREFIX}"
-    /usr
-    /usr/local
-    /opt
-    /opt/TensorRT
-    /usr/src/tensorrt
   PATH_SUFFIXES
+    .
     include
+    includes
     include/${CMAKE_LIBRARY_ARCHITECTURE}
     ${CMAKE_LIBRARY_ARCHITECTURE}
-  REQUIRED
+    targets/${CMAKE_LIBRARY_ARCHITECTURE}/include
 )
+
+if(NOT TENSORRT_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "Could not find TensorRT C++ headers (missing NvInfer.h). "
+    "This native extension needs the TensorRT development headers. NVIDIA's TensorRT pip installation does not include the C++ headers, so `pip install tensorrt` alone is not enough to build this package natively. "
+    "Install the TensorRT development package/tarball or set TENSORRT_ROOT to a full TensorRT SDK install. "
+    "On Debian/Ubuntu with NVIDIA's TensorRT apt repository configured, a common fix is `sudo apt-get update && sudo apt-get install -y libnvinfer-dev` plus the matching runtime package for your TensorRT major version, for example `libnvinfer10` on TensorRT 10.x. "
+    "If you only need docs or lightweight non-native workflows, install with `--config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF`."
+  )
+endif()
 
 message(STATUS "Found TensorRT include dir: ${TENSORRT_INCLUDE_DIR}")
 message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
+message(STATUS "Found CUDA include dirs: ${CUDAToolkit_INCLUDE_DIRS}")
 
 set(NATIVE_SOURCES src/native/main.cpp)
 set(NATIVE_EXTRA_LIBS "")
@@ -177,6 +231,7 @@ pybind11_add_module(_native MODULE ${NATIVE_SOURCES})
 target_include_directories(
   _native
   PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}
     ${TENSORRT_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native
     ${OpenCV_INCLUDE_DIRS}
