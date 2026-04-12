@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.1
+
+- Fixed bugs with x86 (non-jetson) builds
+
 ## 0.3.0
 
 - Added a `yoloe-train` CLI and `python -m yoloe_tensorrt train` entrypoint for YOLOE training and fine-tuning.
