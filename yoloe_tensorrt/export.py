@@ -3,15 +3,16 @@ from __future__ import annotations
 import gc
 import inspect
 import shutil
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
 from ultralytics.nn.modules import Detect
 
-from ._shapes import normalize_imgsz
+from ._shapes import HWShape, ImageSizeLike, normalize_imgsz
 from .artifacts import ArtifactMetadata, ShapeProfile, default_artifact_dir, save_metadata
 from .assets import resolve_model_checkpoint, text_asset_search_roots
 from .logging_utils import get_logger
@@ -29,6 +30,24 @@ PROMPT_PROJECTOR_FILENAME = "prompt_projector.ts"
 LEGACY_ONNX_OPSET = 17
 DYNAMO_ONNX_OPSET = 18
 OnnxExporterMode = Literal["auto", "legacy", "dynamo"]
+
+if TYPE_CHECKING:
+    from torch.export.dynamic_shapes import _Dim as _TorchExportDim
+
+    DynamoDimType: TypeAlias = type[_TorchExportDim]
+else:
+    DynamoDimType: TypeAlias = type
+
+ExportMetadataScalar: TypeAlias = str | int | float | bool | None | Path | torch.device
+ExportMetadataValue: TypeAlias = (
+    ExportMetadataScalar
+    | list["ExportMetadataValue"]
+    | tuple["ExportMetadataValue", ...]
+    | dict[str | int, "ExportMetadataValue"]
+)
+ExportOutputTree: TypeAlias = torch.Tensor | list["ExportOutputTree"] | tuple["ExportOutputTree", ...]
+DynamoDynamicShape: TypeAlias = dict[int, DynamoDimType]
+DynamoDynamicShapes: TypeAlias = tuple[DynamoDynamicShape | None, ...]
 
 LOGGER = get_logger(__name__)
 
@@ -51,13 +70,13 @@ class _ExportRequest:
     dynamic: bool
     build_visual_engine: bool
     fp16: bool
-    imgsz: int | tuple[int, int] | list[int] | None
+    imgsz: ImageSizeLike | None
     max_det: int
     overwrite: bool
     workspace_bytes: int
     onnx_exporter: OnnxExporterMode
     onnx_opset_version: int | None
-    training_metadata: Mapping[str, Any] | None
+    training_metadata: Mapping[str, ExportMetadataValue] | None
 
 
 def _load_yoloe_model(pt_path: str | Path) -> torch.nn.Module:
@@ -76,7 +95,7 @@ def _load_yoloe_model(pt_path: str | Path) -> torch.nn.Module:
     return model
 
 
-def _configure_export_state(model: torch.nn.Module, imgsz: tuple[int, int], dynamic: bool, max_det: int) -> None:
+def _configure_export_state(model: torch.nn.Module, imgsz: HWShape, dynamic: bool, max_det: int) -> None:
     anchors = sum(int(imgsz[0] / stride) * int(imgsz[1] / stride) for stride in model.stride.tolist())
     for module in model.modules():
         if isinstance(module, Detect):
@@ -88,7 +107,7 @@ def _configure_export_state(model: torch.nn.Module, imgsz: tuple[int, int], dyna
             module.shape = None
 
 
-def _flatten_export_outputs(outputs: object) -> tuple[torch.Tensor, ...]:
+def _flatten_export_outputs(outputs: ExportOutputTree) -> tuple[torch.Tensor, ...]:
     if isinstance(outputs, torch.Tensor):
         return (outputs,)
     if isinstance(outputs, (list, tuple)):
@@ -159,13 +178,13 @@ def _resolve_export_request(
     dynamic: bool,
     build_visual_engine: bool,
     fp16: bool,
-    imgsz: int | tuple[int, int] | list[int] | None,
+    imgsz: ImageSizeLike | None,
     max_det: int,
     overwrite: bool,
     workspace_bytes: int,
     onnx_exporter: OnnxExporterMode,
     onnx_opset_version: int | None,
-    training_metadata: Mapping[str, Any] | None,
+    training_metadata: Mapping[str, ExportMetadataValue] | None,
 ) -> _ExportRequest:
     model_path = _resolved_model_path(pt_path)
     artifact_root = Path(artifact_dir) if artifact_dir is not None else default_artifact_dir(model_path)
@@ -208,7 +227,7 @@ def _clear_export_outputs(paths: _ExportPaths) -> None:
             LOGGER.debug("Removed stale artifact '%s'", file_path)
 
 
-def _make_image_profile(dynamic: bool, imgsz: tuple[int, int]) -> ShapeProfile:
+def _make_image_profile(dynamic: bool, imgsz: HWShape) -> ShapeProfile:
     if dynamic:
         min_h = min(320, imgsz[0])
         min_w = min(320, imgsz[1])
@@ -295,7 +314,7 @@ def _make_dynamo_dynamic_shapes(
     args: tuple[torch.Tensor, ...],
     input_names: list[str],
     dynamic_axes: dict[str, dict[int, str]],
-) -> tuple[dict[int, object] | None, ...] | None:
+) -> DynamoDynamicShapes | None:
     if not dynamic_axes:
         return None
 
@@ -306,14 +325,14 @@ def _make_dynamo_dynamic_shapes(
     if len(args) != len(input_names):
         raise ValueError(f"Expected {len(input_names)} input name(s), got {len(args)} input tensor(s)")
 
-    symbolic_dims: dict[str, object] = {}
-    shapes: list[dict[int, object] | None] = []
+    symbolic_dims: dict[str, DynamoDimType] = {}
+    shapes: list[DynamoDynamicShape | None] = []
     for tensor, name in zip(args, input_names):
         spec = dynamic_axes.get(name, {})
         if not spec:
             shapes.append(None)
             continue
-        tensor_spec: dict[int, object] = {}
+        tensor_spec: DynamoDynamicShape = {}
         for dim, dim_name in spec.items():
             if dim < 0 or dim >= tensor.ndim:
                 raise ValueError(
@@ -458,13 +477,13 @@ def export_model(
     dynamic: bool = True,
     build_visual_engine: bool = True,
     fp16: bool = True,
-    imgsz: int | tuple[int, int] | list[int] | None = None,
+    imgsz: ImageSizeLike | None = None,
     max_det: int = 300,
     overwrite: bool = True,
     workspace_bytes: int = 2 << 30,
     onnx_exporter: OnnxExporterMode = "auto",
     onnx_opset_version: int | None = None,
-    training_metadata: Mapping[str, Any] | None = None,
+    training_metadata: Mapping[str, ExportMetadataValue] | None = None,
 ) -> Path:
     request = _resolve_export_request(
         pt_path=pt_path,

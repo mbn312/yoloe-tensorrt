@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from .logging_utils import get_logger
 
 LOGGER = get_logger(__name__)
+NativeComponentT = TypeVar("NativeComponentT")
 
 try:
     from . import _native as _native_module
@@ -16,7 +19,7 @@ try:
 
     NATIVE_AVAILABLE = os.environ.get("YOLOE_TRT_DISABLE_NATIVE", "").lower() not in {"1", "true", "yes"}
     NATIVE_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - import surface depends on local build/runtime libs
+except (ImportError, OSError) as exc:  # pragma: no cover - import surface depends on local build/runtime libs
     NativeMainRuntime = None  # type: ignore[assignment]
     NativeVisualPromptRuntime = None  # type: ignore[assignment]
     NativeJetsonCameraSource = None  # type: ignore[assignment]
@@ -45,14 +48,13 @@ def resolve_cuda_device_id(device: str | int, *, component_name: str) -> int | N
 
 
 def _build_native_component(
-    native_type: object | None,
+    native_type: type[object] | None,
     *,
     unavailable_message: str,
     component_name: str,
     device: str | int,
-    constructor,
-    swallow_errors: bool = False,
-):
+    constructor: Callable[[int], NativeComponentT],
+) -> NativeComponentT | None:
     if not NATIVE_AVAILABLE or native_type is None:
         _log_native_unavailable(unavailable_message)
         return None
@@ -60,13 +62,7 @@ def _build_native_component(
     device_id = resolve_cuda_device_id(device, component_name=component_name)
     if device_id is None:
         return None
-    try:
-        return constructor(device_id)
-    except Exception as exc:  # pragma: no cover - depends on local TensorRT/CUDA runtime state
-        if not swallow_errors:
-            raise
-        LOGGER.warning("%s unavailable: %s", component_name, exc)
-        return None
+    return constructor(device_id)
 
 
 def build_native_main_runtime(
@@ -111,7 +107,6 @@ def build_native_visual_runtime(
             int(visual_stride),
             device_id,
         ),
-        swallow_errors=True,
     )
 
 

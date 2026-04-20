@@ -61,7 +61,7 @@ yoloe-benchmark outputs/artifacts/yoloe26s tests/assets/images/bus.jpg \
   --runs 50 --warmup 5 --output-name matrix-visual-prompts
 ```
 
-`--mode both` runs the historical host plus CUDA pair. `--mode all` runs host, CUDA, and camera paths, and therefore
+`--mode both` runs host and CUDA paths. `--mode all` runs host, CUDA, and camera paths, and therefore
 requires `--camera-source`. Use `--mode none` only with `--text-prompts` or `--visual-prompts` for prompt-update-only
 benchmarks.
 

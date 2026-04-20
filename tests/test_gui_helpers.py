@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +18,7 @@ from yoloe_tensorrt.gui import (
     parse_confidence_text,
     parse_label_text,
     resolve_gui_source_selection,
+    run_camera_gui,
     split_gui_source_selection,
 )
 
@@ -84,6 +85,69 @@ class _CanvasWidget(_Widget):
         self.yview_moveto_calls.append(fraction)
 
 
+class _FakeGuiWindow:
+    last_instance: _FakeGuiWindow | None = None
+
+    def __init__(
+        self,
+        _title: str,
+        source_spec: str,
+        _source_options,
+        _model_name: str,
+        labels: list[str],
+        confidence: float,
+        tracking_enabled: bool,
+        tracker_name: str,
+    ) -> None:
+        _FakeGuiWindow.last_instance = self
+        self._closed = False
+        self._confidence = float(confidence)
+        self._tracking_enabled = bool(tracking_enabled)
+        self._tracker_name = tracker_name
+        self.status_messages: list[str] = []
+        self.applied_messages: list[str | None] = []
+
+    @property
+    def is_open(self) -> bool:
+        return False
+
+    def pump(self) -> None:
+        return
+
+    def take_pending_update(self):
+        return None
+
+    def set_status(self, message: str) -> None:
+        self.status_messages.append(message)
+
+    def confidence(self) -> float:
+        return self._confidence
+
+    def tracking_enabled(self) -> bool:
+        return self._tracking_enabled
+
+    def tracker_name(self) -> str:
+        return self._tracker_name
+
+    def mark_applied(
+        self,
+        source: str,
+        labels: list[str],
+        tracking_enabled: bool,
+        tracker_name: str,
+        message: str | None = None,
+    ) -> None:
+        self._tracking_enabled = bool(tracking_enabled)
+        self._tracker_name = tracker_name
+        self.applied_messages.append(message)
+
+    def show_frame(self, _frame_bgr) -> bool:
+        return False
+
+    def close(self) -> None:
+        self._closed = True
+
+
 def _make_window(
     *,
     active_source: str = "/dev/video0",
@@ -121,6 +185,23 @@ def _make_window(
     return window
 
 
+class _FakeEngine:
+    def __init__(self) -> None:
+        self.metadata = SimpleNamespace(default_imgsz=320, max_det=10, model_name="yoloe-26s-seg.pt", model_path="")
+        self.device = "cuda:0"
+        self.main_fp16 = False
+        self.set_classes_calls: list[list[str]] = []
+
+    def clear_prompts(self) -> None:
+        return None
+
+    def set_classes(self, labels: list[str]) -> None:
+        self.set_classes_calls.append(list(labels))
+
+    def create_tracker(self, *args, **kwargs):
+        raise AssertionError("tracking is disabled in this test")
+
+
 def test_parse_label_text_supports_multiple_labels_and_deduplicates() -> None:
     assert parse_label_text("pen, marker\nbottle, pen") == ["pen", "marker", "bottle"]
 
@@ -134,6 +215,37 @@ def test_parse_confidence_text_clamps_and_falls_back() -> None:
     assert parse_confidence_text("2.0") == 1.0
     assert parse_confidence_text("-0.5") == 0.0
     assert parse_confidence_text("bad", fallback=0.33) == 0.33
+
+
+def test_run_camera_gui_handles_expected_initial_source_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("yoloe_tensorrt.gui.CameraGuiWindow", _FakeGuiWindow)
+
+    engine = _FakeEngine()
+
+    displayed = run_camera_gui(
+        engine,
+        tracking=False,
+        make_source=lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad source")),
+    )
+
+    window = _FakeGuiWindow.last_instance
+    assert displayed == 0
+    assert window is not None
+    assert window.status_messages == ["Unable to open source '/dev/video0': bad source"]
+    assert window._closed is True
+
+
+def test_run_camera_gui_propagates_unexpected_initial_source_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("yoloe_tensorrt.gui.CameraGuiWindow", _FakeGuiWindow)
+
+    engine = _FakeEngine()
+
+    with pytest.raises(KeyError, match="bad source state"):
+        run_camera_gui(
+            engine,
+            tracking=False,
+            make_source=lambda *args, **kwargs: (_ for _ in ()).throw(KeyError("bad source state")),
+        )
 
 
 def test_display_model_name_removes_last_extension() -> None:
@@ -432,16 +544,12 @@ def test_show_frame_handles_tclerror_during_shutdown(monkeypatch: pytest.MonkeyP
     assert window._closed is True
 
 
-def test_python_launcher_displays_help() -> None:
+def test_python_launcher_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     launcher = repo_root / "scripts" / "launch_camera_gui.py"
-    result = subprocess.run(
-        [sys.executable, str(launcher), "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=repo_root,
-    )
+    result = run_python_help([str(launcher)])
     assert result.returncode == 0
     assert "Launch the YOLOE TensorRT live camera GUI." in result.stdout
     assert "--track" in result.stdout
@@ -453,9 +561,9 @@ def test_shell_launcher_prefers_console_script_when_available(tmp_path: Path) ->
     launcher = repo_root / "scripts" / "launch_camera_gui.sh"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    stub = bin_dir / "yoloe-camera-gui"
-    stub.write_text("#!/usr/bin/env bash\nprintf 'stub-launcher %s\\n' \"$*\"\n", encoding="utf-8")
-    stub.chmod(0o755)
+    fake_launcher = bin_dir / "yoloe-camera-gui"
+    fake_launcher.write_text("#!/usr/bin/env bash\nprintf 'fake-launcher %s\\n' \"$*\"\n", encoding="utf-8")
+    fake_launcher.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
@@ -468,4 +576,4 @@ def test_shell_launcher_prefers_console_script_when_available(tmp_path: Path) ->
         env=env,
     )
     assert result.returncode == 0
-    assert "stub-launcher --help" in result.stdout
+    assert "fake-launcher --help" in result.stdout

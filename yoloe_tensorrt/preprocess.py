@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from ultralytics.data.augment import LetterBox
 
-from ._shapes import normalize_imgsz
+from ._shapes import ImageSizeLike, normalize_imgsz
 from .logging_utils import get_logger
 from .source import SourceItem
 from .tensor_utils import torch_from_numpy_safe
@@ -24,7 +24,7 @@ class PreprocessedSample:
 
 def preprocess_image(
     item: SourceItem,
-    imgsz: int | tuple[int, int] | list[int],
+    imgsz: ImageSizeLike,
     device: torch.device,
     fp16: bool,
     stride: int,

@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from ultralytics.data.augment import LetterBox, LoadVisualPrompt
 from ultralytics.nn.text_model import MobileCLIP, MobileCLIPTS, build_text_model
 
+from ._shapes import HWShape
 from .assets import download_text_asset, text_asset_cache_dir, text_asset_search_roots
 from .logging_utils import get_logger
 from .tensor_utils import torch_from_numpy_safe
@@ -218,7 +219,7 @@ def normalize_visual_prompt_masks(
 
 def _resize_masks(
     masks: np.ndarray | list[np.ndarray] | torch.Tensor,
-    dst_shape: tuple[int, int],
+    dst_shape: HWShape,
 ) -> np.ndarray:
     masks_array = normalize_visual_prompt_masks(masks)
     letterbox = LetterBox(
@@ -242,7 +243,7 @@ def _resize_masks(
 
 def build_visual_prompt_batch(
     image: np.ndarray,
-    dst_shape: tuple[int, int],
+    dst_shape: HWShape,
     visual_stride: int,
     bboxes: np.ndarray | list[list[float]] | None = None,
     masks: np.ndarray | list[np.ndarray] | torch.Tensor | None = None,

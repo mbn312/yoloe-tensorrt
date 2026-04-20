@@ -802,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     runs = int(args.runs)
     warmup = int(args.warmup)
+    confidence = float(args.conf)
     selected_modes = _selected_modes(str(args.mode))
     if runs <= 0:
         parser.error("--runs must be greater than 0")
@@ -826,6 +827,12 @@ def main(argv: list[str] | None = None) -> int:
 
     labels = list(args.labels or ["bus"])
     target_size = normalize_imgsz(int(args.imgsz))
+    benchmark_kwargs = {
+        "runs": runs,
+        "warmup": warmup,
+        "profile_allocations": bool(args.profile_allocations),
+        "allocation_top": int(args.allocation_top),
+    }
     created_at = _make_created_at()
     document = _benchmark_metadata(args, created_at)
     document["results"] = {}
@@ -860,10 +867,7 @@ def main(argv: list[str] | None = None) -> int:
         document["results"]["text-set-classes"] = _benchmark_runner(
             "text-set-classes",
             _run_text_prompt,
-            runs=runs,
-            warmup=warmup,
-            profile_allocations=bool(args.profile_allocations),
-            allocation_top=int(args.allocation_top),
+            **benchmark_kwargs,
             setup=_setup_text_prompt,
         )
 
@@ -872,18 +876,15 @@ def main(argv: list[str] | None = None) -> int:
     def _run_host():
         item = _benchmark_item()
         if host_tracker is not None:
-            return host_tracker.update(item, source_key="benchmark", imgsz=target_size, conf=float(args.conf))
-        return engine.predict_item(item, imgsz=target_size, conf=float(args.conf))
+            return host_tracker.update(item, source_key="benchmark", imgsz=target_size, conf=confidence)
+        return engine.predict_item(item, imgsz=target_size, conf=confidence)
 
     if "host" in selected_modes:
         name = "host-track" if args.track else "host"
         document["results"][name] = _benchmark_runner(
             name,
             _run_host,
-            runs=runs,
-            warmup=warmup,
-            profile_allocations=bool(args.profile_allocations),
-            allocation_top=int(args.allocation_top),
+            **benchmark_kwargs,
         )
 
     if "cuda" in selected_modes:
@@ -895,27 +896,21 @@ def main(argv: list[str] | None = None) -> int:
                 return cuda_tracker.update(
                     prepared_input,
                     source_key="benchmark",
-                    conf=float(args.conf),
+                    conf=confidence,
                     input_hint="prepared",
                     cuda=True,
                 )
-            return engine.predict(prepared_input, conf=float(args.conf))[0]
+            return engine.predict(prepared_input, conf=confidence)[0]
 
         name = "cuda-track" if args.track else "cuda"
         document["results"][name] = _benchmark_runner(
             name,
             _run_cuda,
-            runs=runs,
-            warmup=warmup,
-            profile_allocations=bool(args.profile_allocations),
-            allocation_top=int(args.allocation_top),
+            **benchmark_kwargs,
         )
 
     if "camera" in selected_modes:
-        try:
-            camera_fp16 = bool(getattr(engine, "main_fp16", False))
-        except Exception:
-            camera_fp16 = False
+        camera_fp16 = bool(engine.main_fp16)
         camera_source = _camera_source_from_spec(
             str(args.camera_source),
             width=args.camera_width,
@@ -944,19 +939,16 @@ def main(argv: list[str] | None = None) -> int:
                     frame,
                     source_key="benchmark-camera",
                     imgsz=target_size,
-                    conf=float(args.conf),
+                    conf=confidence,
                 )
-            return engine.predict_item(frame, imgsz=target_size, conf=float(args.conf))
+            return engine.predict_item(frame, imgsz=target_size, conf=confidence)
 
         name = "camera-track" if args.track else "camera"
         try:
             document["results"][name] = _benchmark_runner(
                 name,
                 _run_camera,
-                runs=runs,
-                warmup=warmup,
-                profile_allocations=bool(args.profile_allocations),
-                allocation_top=int(args.allocation_top),
+                **benchmark_kwargs,
             )
         finally:
             _close_if_available(camera_frames)

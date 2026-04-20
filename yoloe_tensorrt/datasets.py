@@ -5,11 +5,15 @@ import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Literal, Mapping, TypeAlias
 
 import yaml
 
 DatasetTask = Literal["detect", "segment"]
+DatasetScalarValue: TypeAlias = str | int | float | bool | None | Path
+DatasetValue: TypeAlias = (
+    DatasetScalarValue | list["DatasetValue"] | tuple["DatasetValue", ...] | Mapping[str | int, "DatasetValue"]
+)
 
 _CLASS_ID_RE = re.compile(r"^[+-]?\d+$")
 _IMAGE_SUFFIXES = {
@@ -63,7 +67,7 @@ class _SplitValidation:
 
 
 def validate_dataset_config(
-    config: str | Path | Mapping[str, Any],
+    config: str | Path | Mapping[str, DatasetValue],
     *,
     task: DatasetTask = "detect",
     require_test: bool = False,
@@ -116,7 +120,7 @@ def validate_dataset_config(
     )
 
 
-def _load_config(config: str | Path | Mapping[str, Any]) -> tuple[dict[str, Any], Path | None, Path]:
+def _load_config(config: str | Path | Mapping[str, DatasetValue]) -> tuple[dict[str, DatasetValue], Path | None, Path]:
     if isinstance(config, str | Path):
         config_path = Path(config).expanduser()
         if not config_path.exists():
@@ -142,7 +146,7 @@ def _load_config(config: str | Path | Mapping[str, Any]) -> tuple[dict[str, Any]
     raise DatasetValidationError(f"Dataset config must be a path or mapping, got {type(config).__name__}.")
 
 
-def _resolve_dataset_root(data: Mapping[str, Any], base_dir: Path) -> Path:
+def _resolve_dataset_root(data: Mapping[str, DatasetValue], base_dir: Path) -> Path:
     raw_root = data.get("path")
     if raw_root is None:
         return base_dir
@@ -157,7 +161,7 @@ def _resolve_dataset_root(data: Mapping[str, Any], base_dir: Path) -> Path:
     return root
 
 
-def _normalize_names(raw_names: Any, raw_nc: Any) -> dict[int, str]:
+def _normalize_names(raw_names: DatasetValue, raw_nc: DatasetValue) -> dict[int, str]:
     if raw_names is None:
         raise DatasetValidationError("Dataset config is missing required 'names' class metadata.")
 
@@ -197,7 +201,7 @@ def _normalize_names(raw_names: Any, raw_nc: Any) -> dict[int, str]:
     return names
 
 
-def _normalize_class_key(raw_key: Any) -> int:
+def _normalize_class_key(raw_key: DatasetValue) -> int:
     if isinstance(raw_key, bool):
         raise DatasetValidationError(f"Dataset class index must be an integer, got {raw_key!r}.")
     if isinstance(raw_key, int):
@@ -211,7 +215,7 @@ def _normalize_class_key(raw_key: Any) -> int:
     return key
 
 
-def _validate_class_name(raw_value: Any, index: int) -> str:
+def _validate_class_name(raw_value: DatasetValue, index: int) -> str:
     if not isinstance(raw_value, str):
         raise DatasetValidationError(f"Dataset class name at index {index} must be a string.")
     value = raw_value.strip()
@@ -231,7 +235,7 @@ def _duplicate_class_names(names: Mapping[int, str]) -> list[str]:
 
 
 def _validate_required_split(
-    data: Mapping[str, Any],
+    data: Mapping[str, DatasetValue],
     split_name: str,
     *,
     root: Path,
@@ -268,7 +272,7 @@ def _validate_required_split(
     )
 
 
-def _resolve_split_sources(raw_split: Any, split_name: str, root: Path) -> tuple[Path, ...]:
+def _resolve_split_sources(raw_split: DatasetValue, split_name: str, root: Path) -> tuple[Path, ...]:
     if isinstance(raw_split, str | Path):
         raw_sources = [raw_split]
     elif isinstance(raw_split, list | tuple):

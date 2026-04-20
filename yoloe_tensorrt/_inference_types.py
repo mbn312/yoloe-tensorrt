@@ -4,14 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
-from .source import PreparedFrameMetadata, SourceItem
+from ._shapes import HWShape
+from .source import OriginalImageReference, SourceItem
 
 
 @dataclass(frozen=True)
 class PreparedTensorInput:
     tensor: torch.Tensor
     path: str
-    original_image: SourceItem | PreparedFrameMetadata | object | None = None
+    original_image: OriginalImageReference = None
     producer_stream: int | None = None
 
     def __post_init__(self) -> None:
@@ -32,7 +33,7 @@ class PreparedTensorInput:
 @dataclass(frozen=True)
 class PreparedExecutionInput:
     tensor: torch.Tensor
-    input_shape: tuple[int, int]
+    input_shape: HWShape
     producer_stream: int
 
 
@@ -40,7 +41,7 @@ def prepare_tensor_input(
     tensor: torch.Tensor | object,
     *,
     path: str,
-    original_image: SourceItem | PreparedFrameMetadata | object | None = None,
+    original_image: OriginalImageReference = None,
     producer_stream: int | None = None,
 ) -> PreparedTensorInput:
     if isinstance(tensor, PreparedTensorInput):

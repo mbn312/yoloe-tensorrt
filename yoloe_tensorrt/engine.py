@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import TYPE_CHECKING, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -11,10 +12,9 @@ from ultralytics.engine.results import Results
 from ultralytics.utils import nms, ops
 
 from ._inference_types import PreparedExecutionInput, PreparedTensorInput, prepare_tensor_input
-from ._shapes import normalize_imgsz
+from ._shapes import HWShape, ImageSizeLike, normalize_imgsz
 from .artifacts import ArtifactMetadata, default_artifact_dir, load_metadata, resolve_artifact_file
 from .assets import text_asset_search_roots
-from .export import export_model
 from .inputs import (
     InferenceSourceItem,
     iter_inference_sources,
@@ -26,22 +26,53 @@ from .native_backend import (
     build_native_visual_runtime,
 )
 from .preprocess import preprocess_image
-from .prompts import (
-    TextPromptEncoder,
-    build_visual_prompt_batch,
-    compile_text_embeddings,
-    concat_prompt_embeddings,
-    load_prompt_projector,
-    normalize_visual_prompt_boxes,
-    normalize_visual_prompt_masks,
-    resolve_text_asset_path,
-    resolve_visual_prompt_categories,
-)
 from .source import PreparedFrameMetadata, SourceItem, normalize_source
-from .tracking import DEFAULT_TRACKER, YOLOETrackerSession
 from .trt import TensorRTRuntime
 
+if TYPE_CHECKING:
+    from .prompts import TextPromptEncoder
+    from .tracking import YOLOETrackerSession
+
 LOGGER = get_logger(__name__)
+
+_DEFAULT_TRACKER = "bytetrack"
+
+
+@lru_cache(maxsize=1)
+def _export_module():
+    from . import export as export_module
+
+    return export_module
+
+
+@lru_cache(maxsize=1)
+def _prompt_module():
+    from . import prompts as prompt_module
+
+    return prompt_module
+
+
+@lru_cache(maxsize=1)
+def _tracking_module():
+    from . import tracking as tracking_module
+
+    return tracking_module
+
+
+def export_model(*args, **kwargs):
+    return _export_module().export_model(*args, **kwargs)
+
+
+def load_prompt_projector(*args, **kwargs):
+    return _prompt_module().load_prompt_projector(*args, **kwargs)
+
+
+def resolve_text_asset_path(*args, **kwargs):
+    return _prompt_module().resolve_text_asset_path(*args, **kwargs)
+
+
+def concat_prompt_embeddings(*args, **kwargs):
+    return _prompt_module().concat_prompt_embeddings(*args, **kwargs)
 
 
 class YOLOEEngine:
@@ -159,16 +190,13 @@ class YOLOEEngine:
         )
         native_visual_runtime = None
         if visual_engine and visual_engine.is_file():
-            try:
-                native_visual_runtime = build_native_visual_runtime(
-                    visual_engine,
-                    image_input_name=metadata.image_input_name,
-                    visual_input_name=metadata.visual_input_name,
-                    visual_stride=metadata.visual_stride,
-                    device=device,
-                )
-            except Exception as exc:
-                LOGGER.warning("Native visual runtime unavailable; falling back to Python TensorRT path: %s", exc)
+            native_visual_runtime = build_native_visual_runtime(
+                visual_engine,
+                image_input_name=metadata.image_input_name,
+                visual_input_name=metadata.visual_input_name,
+                visual_stride=metadata.visual_stride,
+                device=device,
+            )
 
         return cls(
             artifact_dir=artifact_root,
@@ -189,7 +217,7 @@ class YOLOEEngine:
     def _get_text_encoder(self) -> TextPromptEncoder:
         if self._text_encoder is None:
             LOGGER.info("Resolving text encoder for '%s'", self.metadata.text_model)
-            self._text_encoder = TextPromptEncoder(
+            self._text_encoder = _prompt_module().TextPromptEncoder(
                 self.metadata.text_model,
                 device=self.device,
                 weight_path=self._text_encoder_path,
@@ -243,11 +271,10 @@ class YOLOEEngine:
     def _sync_native_prompt_embeddings(self) -> None:
         if self.native_main_runtime is None:
             return
-        try:
-            embeddings, _ = self._active_prompt_embeddings()
-        except RuntimeError:
+        if not (self._text_names or self._visual_names):
             self.native_main_runtime.clear_prompt_embeddings()
             return
+        embeddings, _ = self._active_prompt_embeddings()
         tensor = embeddings.detach().contiguous()
         if hasattr(self.native_main_runtime, "set_prompt_embeddings_device"):
             target_dtype = (
@@ -305,7 +332,7 @@ class YOLOEEngine:
         resolved = [str(name) for name in classes]
         if not resolved:
             raise ValueError("classes must not be empty")
-        embeddings = compile_text_embeddings(
+        embeddings = _prompt_module().compile_text_embeddings(
             resolved,
             encoder=self._get_text_encoder(),
             projector=self.prompt_projector,
@@ -347,7 +374,7 @@ class YOLOEEngine:
         bboxes: list[list[float]] | None = None,
         masks: object | None = None,
         classes: list[str] | None = None,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
     ) -> None:
         if self.native_visual_runtime is None and self.visual_runtime is None:
             raise RuntimeError("This artifact bundle does not include a visual-prompt engine")
@@ -356,16 +383,17 @@ class YOLOEEngine:
         LOGGER.info("Setting visual prompts from '%s'", self._describe_source(refer_image))
         source_item = normalize_source(refer_image, default_prefix="refer")[0]
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
-        boxes = normalize_visual_prompt_boxes(bboxes) if bboxes is not None else None
+        prompt_module = _prompt_module()
+        boxes = prompt_module.normalize_visual_prompt_boxes(bboxes) if bboxes is not None else None
         masks_array = None
         if boxes is not None:
             prompt_count = int(boxes.shape[0])
         elif masks is not None:
-            masks_array = normalize_visual_prompt_masks(masks)
+            masks_array = prompt_module.normalize_visual_prompt_masks(masks)
             prompt_count = int(masks_array.shape[0])
         else:
             prompt_count = 0
-        categories, names = resolve_visual_prompt_categories(prompt_count, classes)
+        categories, names = prompt_module.resolve_visual_prompt_categories(prompt_count, classes)
 
         if self.native_visual_runtime is not None:
             native_outputs = self.native_visual_runtime.infer_image(
@@ -387,7 +415,7 @@ class YOLOEEngine:
                 fp16=self.visual_runtime.fp16,
                 stride=self.metadata.stride,
             )
-            prompt_batch = build_visual_prompt_batch(
+            prompt_batch = prompt_module.build_visual_prompt_batch(
                 image=sample.original,
                 dst_shape=sample.transformed.shape[:2],
                 visual_stride=self.metadata.visual_stride,
@@ -414,7 +442,7 @@ class YOLOEEngine:
             self._visual_names,
         )
 
-    def warmup(self, imgsz: int | tuple[int, int] | list[int] | None = None) -> None:
+    def warmup(self, imgsz: ImageSizeLike | None = None) -> None:
         target = normalize_imgsz(imgsz or self.metadata.default_imgsz)
         LOGGER.info("Warming up YOLOEEngine at imgsz=%s", target)
         prompt_count = (
@@ -449,17 +477,16 @@ class YOLOEEngine:
 
     @property
     def active_names(self) -> list[str]:
-        try:
-            return list(self._active_prompt_names())
-        except RuntimeError:
+        if not (self._text_names or self._visual_names):
             return []
+        return list(self._active_prompt_names())
 
     def _postprocess_predictions(
         self,
         outputs: dict[str, torch.Tensor],
         original_image: np.ndarray,
         path: str,
-        input_shape: tuple[int, int],
+        input_shape: HWShape,
         names: Sequence[str],
         conf: float,
         iou: float,
@@ -502,7 +529,7 @@ class YOLOEEngine:
     def _predict_one(
         self,
         item: SourceItem,
-        imgsz: tuple[int, int],
+        imgsz: HWShape,
         conf: float,
         iou: float,
         max_det: int,
@@ -545,7 +572,7 @@ class YOLOEEngine:
                 native_infer_image = self._native_infer_image
                 if native_infer_image is None:
                     raise RuntimeError("Native main runtime does not support image inference")
-                result = self._build_native_legacy_result(
+                result = self._build_native_raw_result(
                     native_outputs=native_infer_image(item.image, imgsz[0], imgsz[1]),
                     original_image=item.image,
                     path=item.path,
@@ -609,7 +636,7 @@ class YOLOEEngine:
         self,
         original_image: SourceItem | PreparedFrameMetadata | object | None,
         path: str | None,
-        input_shape: tuple[int, int],
+        input_shape: HWShape,
     ) -> tuple[np.ndarray, str]:
         if isinstance(original_image, SourceItem):
             return original_image.image, path or original_image.path
@@ -644,7 +671,7 @@ class YOLOEEngine:
         masks = from_dlpack(native_outputs["masks"]) if "masks" in native_outputs else None
         return Results(original_image, path=path, names=names_map, boxes=boxes, masks=masks, speed=speed)
 
-    def _build_native_legacy_result(
+    def _build_native_raw_result(
         self,
         native_outputs: dict[str, object],
         original_image: np.ndarray,
@@ -654,7 +681,7 @@ class YOLOEEngine:
         iou: float,
         max_det: int,
         retina_masks: bool,
-        input_shape: tuple[int, int] | None = None,
+        input_shape: HWShape | None = None,
     ) -> Results:
         outputs = {name: from_dlpack(native_outputs[name]) for name in self._main_output_names}
         resolved_input_shape = (
@@ -771,7 +798,7 @@ class YOLOEEngine:
                 native_infer_tensor = self._native_infer_tensor
                 if native_infer_tensor is None:
                     raise RuntimeError("Native main runtime does not support tensor inference")
-                result = self._build_native_legacy_result(
+                result = self._build_native_raw_result(
                     native_outputs=native_infer_tensor(
                         int(image_tensor.data_ptr()),
                         input_shape[0],
@@ -831,7 +858,7 @@ class YOLOEEngine:
     def _predict_input_entry(
         self,
         item: InferenceSourceItem,
-        imgsz: int | tuple[int, int] | list[int] | None,
+        imgsz: ImageSizeLike | None,
         conf: float,
         iou: float,
         max_det: int,
@@ -858,7 +885,7 @@ class YOLOEEngine:
     def predict_item(
         self,
         item: InferenceSourceItem,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
@@ -877,7 +904,7 @@ class YOLOEEngine:
     def prepare_cuda_input(
         self,
         source: SourceItem | object,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
     ) -> PreparedTensorInput:
         item = source if isinstance(source, SourceItem) else normalize_source(source, default_prefix="tensor")[0]
         target_size = normalize_imgsz(imgsz or self.metadata.default_imgsz)
@@ -922,7 +949,7 @@ class YOLOEEngine:
     def _predict_iter(
         self,
         source: object,
-        imgsz: tuple[int, int],
+        imgsz: HWShape,
         conf: float,
         iou: float,
         max_det: int,
@@ -953,11 +980,11 @@ class YOLOEEngine:
 
     def create_tracker(
         self,
-        tracker: str = DEFAULT_TRACKER,
+        tracker: str = _DEFAULT_TRACKER,
         tracker_config: str | Path | dict | None = None,
         frame_rate: int = 30,
     ) -> YOLOETrackerSession:
-        return YOLOETrackerSession(
+        return _tracking_module().YOLOETrackerSession(
             self,
             tracker=tracker,
             tracker_config=tracker_config,
@@ -967,7 +994,7 @@ class YOLOEEngine:
     def _track_iter(
         self,
         source: object,
-        imgsz: tuple[int, int],
+        imgsz: HWShape,
         conf: float,
         iou: float,
         max_det: int,
@@ -1008,7 +1035,7 @@ class YOLOEEngine:
         self,
         source: object,
         stream: bool = False,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
@@ -1049,12 +1076,12 @@ class YOLOEEngine:
         self,
         source: object,
         stream: bool = False,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
         retina_masks: bool = False,
-        tracker: str = DEFAULT_TRACKER,
+        tracker: str = _DEFAULT_TRACKER,
         tracker_config: str | Path | dict | None = None,
         frame_rate: int = 30,
         cuda: bool | None = None,

@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ._shapes import HWShape, TensorShape, normalize_hw_shape
+
 
 def _json_compatible(value: Any) -> Any:
     if value is None or isinstance(value, str | int | float | bool):
@@ -21,9 +23,9 @@ def _json_compatible(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class ShapeProfile:
-    minimum: tuple[int, ...]
-    optimum: tuple[int, ...]
-    maximum: tuple[int, ...]
+    minimum: TensorShape
+    optimum: TensorShape
+    maximum: TensorShape
 
     def to_dict(self) -> dict[str, list[int]]:
         return {
@@ -49,7 +51,7 @@ class ArtifactMetadata:
     task: str
     end2end: bool
     dynamic: bool
-    default_imgsz: tuple[int, int]
+    default_imgsz: HWShape
     stride: int
     visual_stride: int
     embed_dim: int
@@ -91,7 +93,7 @@ class ArtifactMetadata:
             task=data["task"],
             end2end=bool(data["end2end"]),
             dynamic=bool(data["dynamic"]),
-            default_imgsz=tuple(int(v) for v in data["default_imgsz"]),
+            default_imgsz=normalize_hw_shape(data["default_imgsz"], name="default_imgsz"),
             stride=int(data["stride"]),
             visual_stride=int(data["visual_stride"]),
             embed_dim=int(data["embed_dim"]),

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
-import sys
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from yoloe_tensorrt import benchmark_cli
+from yoloe_tensorrt import benchmark_cli, export_cli
 from yoloe_tensorrt.benchmark_cli import (
     _benchmark_runner,
     _compare_benchmark_results,
@@ -21,17 +22,11 @@ from yoloe_tensorrt.benchmark_cli import (
 )
 from yoloe_tensorrt.source import SourceItem
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
-def test_module_entrypoint_displays_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "yoloe_tensorrt", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
+def test_module_entrypoint_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_python_help(["-m", "yoloe_tensorrt"])
     assert result.returncode == 0
     assert "CLI entry points for yoloe-tensorrt." in result.stdout
     assert "camera-gui" in result.stdout
@@ -40,40 +35,77 @@ def test_module_entrypoint_displays_help() -> None:
     assert "train" in result.stdout
 
 
-def test_export_cli_displays_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "yoloe_tensorrt", "export", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
+def test_export_cli_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_python_help(["-m", "yoloe_tensorrt", "export"])
     assert result.returncode == 0
     assert "Export a YOLOE checkpoint into a yoloe-tensorrt artifact bundle." in result.stdout
 
 
-def test_camera_gui_cli_displays_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "yoloe_tensorrt", "camera-gui", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
+def test_export_cli_build_export_kwargs_applies_standalone_defaults() -> None:
+    args = export_cli.build_arg_parser().parse_args(["model.pt"])
+
+    assert export_cli.build_export_kwargs(args) == {
+        "artifact_dir": None,
+        "formats": ("onnx", "engine"),
+        "dynamic": True,
+        "build_visual_engine": True,
+        "fp16": True,
+        "imgsz": 640,
+        "max_det": 300,
+        "overwrite": False,
+        "workspace_bytes": 2048 << 20,
+        "onnx_exporter": "auto",
+        "onnx_opset_version": None,
+    }
+
+
+def test_export_cli_build_post_training_export_kwargs_applies_training_defaults() -> None:
+    parser = argparse.ArgumentParser()
+    export_cli.add_post_training_export_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--export-format",
+            "engine",
+            "--export-fixed",
+            "--export-no-visual-engine",
+            "--export-workspace-mb",
+            "64",
+            "--export-artifact-dir",
+            "outputs/artifacts/run",
+        ]
     )
+
+    assert export_cli.build_post_training_export_kwargs(args) == {
+        "export_artifact_dir": Path("outputs/artifacts/run"),
+        "export_formats": ("engine",),
+        "export_dynamic": False,
+        "export_build_visual_engine": False,
+        "export_fp16": True,
+        "export_imgsz": None,
+        "export_max_det": 300,
+        "export_overwrite": False,
+        "export_workspace_bytes": 64 << 20,
+        "export_onnx_exporter": "auto",
+        "export_onnx_opset_version": None,
+    }
+
+
+def test_camera_gui_cli_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_python_help(["-m", "yoloe_tensorrt", "camera-gui"])
     assert result.returncode == 0
     assert "Launch the YOLOE TensorRT live camera GUI." in result.stdout
     assert "--track" in result.stdout
     assert "--tracker" in result.stdout
 
 
-def test_benchmark_cli_displays_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "yoloe_tensorrt", "benchmark", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
+def test_benchmark_cli_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_python_help(["-m", "yoloe_tensorrt", "benchmark"])
     assert result.returncode == 0
     assert "Benchmark YOLOE TensorRT runtime paths" in result.stdout
     assert "--mode" in result.stdout
@@ -692,6 +724,49 @@ def test_benchmark_camera_mode_uses_finite_source(monkeypatch: pytest.MonkeyPatc
     assert source_kwargs["target_imgsz"] == (640, 640)
     assert source_kwargs["zero_copy"] is None
     assert source_kwargs["fp16"] is True
+
+
+def test_benchmark_camera_mode_propagates_main_fp16_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _Engine:
+        native_visual_runtime = None
+
+        def clear_prompts(self) -> None:
+            pass
+
+        def set_classes(self, _labels: list[str]) -> None:
+            pass
+
+        @property
+        def main_fp16(self) -> bool:
+            raise RuntimeError("main runtime is not initialized")
+
+    monkeypatch.setattr(benchmark_cli, "_build_engine", lambda *_args, **_kwargs: _Engine())
+    monkeypatch.setattr(
+        "yoloe_tensorrt.source.normalize_source",
+        lambda *_args, **_kwargs: pytest.fail("camera-only benchmark should not decode the image argument"),
+    )
+
+    with pytest.raises(RuntimeError, match="main runtime is not initialized"):
+        benchmark_cli.main(
+            [
+                str(tmp_path / "artifact"),
+                str(tmp_path / "image.jpg"),
+                "--mode",
+                "camera",
+                "--camera-source",
+                "dummy://ball",
+                "--runs",
+                "1",
+                "--warmup",
+                "0",
+                "--no-save",
+                "--log-level",
+                "WARNING",
+            ]
+        )
 
 
 def test_benchmark_camera_mode_closes_source_on_early_exhaustion(

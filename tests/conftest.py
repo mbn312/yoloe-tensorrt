@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,7 @@ from yoloe_tensorrt import (
 from yoloe_tensorrt.assets import default_example_model_spec, resolve_model_checkpoint
 
 TESTS_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = TESTS_ROOT.parent
 TEST_MODEL_SPEC = os.environ.get("YOLOE_TRT_TEST_MODEL", default_example_model_spec())
 TEST_IMAGES = {
     "bus": TESTS_ROOT / "assets" / "images" / "bus.jpg",
@@ -84,6 +87,20 @@ def test_images() -> dict[str, Path]:
     if missing:
         pytest.skip(f"Checked-in image fixtures are missing: {missing}")
     return TEST_IMAGES
+
+
+@pytest.fixture
+def run_python_help() -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, *args, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+
+    return _run
 
 
 @pytest.fixture(scope="session")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Protocol, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -10,20 +10,35 @@ import yaml
 from ultralytics.engine.results import Results
 from ultralytics.utils import IterableSimpleNamespace
 
-from ._inference_types import prepare_tensor_input
-from .inputs import InferenceSourceItem, normalize_single_inference_source
+from ._inference_types import PreparedTensorInput, prepare_tensor_input
+from ._shapes import ImageSizeLike
 from .logging_utils import get_logger
 from .source import SourceItem
-
-if TYPE_CHECKING:
-    from .engine import YOLOEEngine
 
 LOGGER = get_logger(__name__)
 
 DEFAULT_TRACKER = "bytetrack"
 AVAILABLE_TRACKERS = ("bytetrack", "botsort")
+TrackerConfigValue: TypeAlias = str | int | float | bool | None
+TrackerConfig: TypeAlias = dict[str, TrackerConfigValue]
 
-DEFAULT_TRACKER_CONFIGS: dict[str, dict[str, Any]] = {
+
+class TrackerEngine(Protocol):
+    @property
+    def prompt_generation(self) -> int: ...
+
+    def predict_item(
+        self,
+        item: SourceItem | PreparedTensorInput,
+        **kwargs,
+    ) -> Results: ...
+
+
+class _TrackerBackend(Protocol):
+    def update(self, boxes: np.ndarray, image: np.ndarray) -> np.ndarray: ...
+
+
+DEFAULT_TRACKER_CONFIGS: dict[str, TrackerConfig] = {
     "bytetrack": {
         "tracker_type": "bytetrack",
         "track_high_thresh": 0.25,
@@ -65,13 +80,13 @@ def normalize_tracker_name(tracker: str | None) -> str:
 
 def resolve_tracker_config(
     tracker: str,
-    tracker_config: str | Path | dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    tracker_config: str | Path | TrackerConfig | None = None,
+) -> TrackerConfig:
     tracker_name = normalize_tracker_name(tracker)
     config = deepcopy(DEFAULT_TRACKER_CONFIGS[tracker_name])
 
     if tracker_config is None:
-        overrides: dict[str, Any] = {}
+        overrides: TrackerConfig = {}
     elif isinstance(tracker_config, dict):
         overrides = dict(tracker_config)
     else:
@@ -82,7 +97,7 @@ def resolve_tracker_config(
         if loaded is None:
             overrides = {}
         elif isinstance(loaded, dict):
-            overrides = loaded
+            overrides = cast(TrackerConfig, loaded)
         else:
             raise ValueError(f"Tracker config file must contain a mapping, got: {type(loaded)!r}")
 
@@ -97,7 +112,7 @@ def resolve_tracker_config(
     return config
 
 
-def _build_tracker_backend(tracker: str, config: dict[str, Any], frame_rate: int):
+def _build_tracker_backend(tracker: str, config: TrackerConfig, frame_rate: int) -> _TrackerBackend:
     from ultralytics.trackers.bot_sort import BOTSORT
     from ultralytics.trackers.byte_tracker import BYTETracker
 
@@ -110,7 +125,7 @@ def _build_tracker_backend(tracker: str, config: dict[str, Any], frame_rate: int
     return tracker_cls(args=IterableSimpleNamespace(**config), frame_rate=int(frame_rate))
 
 
-def _apply_tracking_to_result(result: Results, tracker_backend) -> Results:
+def _apply_tracking_to_result(result: Results, tracker_backend: _TrackerBackend) -> Results:
     if result.boxes is None or len(result.boxes) == 0:
         return result
 
@@ -132,15 +147,14 @@ def _apply_tracking_to_result(result: Results, tracker_backend) -> Results:
 class YOLOETrackerSession:
     def __init__(
         self,
-        engine: YOLOEEngine,
+        engine: TrackerEngine,
         tracker: str = DEFAULT_TRACKER,
-        tracker_config: str | Path | dict[str, Any] | None = None,
+        tracker_config: str | Path | TrackerConfig | None = None,
         frame_rate: int = 30,
     ) -> None:
         self.engine = engine
         self.tracker_name = normalize_tracker_name(tracker)
         self.frame_rate = int(frame_rate)
-        self._tracker_config_input = tracker_config
         self._tracker_config = resolve_tracker_config(self.tracker_name, tracker_config)
         self._backend = _build_tracker_backend(self.tracker_name, self._tracker_config, self.frame_rate)
         self._prompt_generation = int(engine.prompt_generation)
@@ -152,7 +166,7 @@ class YOLOETrackerSession:
         )
 
     @property
-    def config(self) -> dict[str, Any]:
+    def config(self) -> TrackerConfig:
         return deepcopy(self._tracker_config)
 
     def reset(self) -> None:
@@ -181,9 +195,9 @@ class YOLOETrackerSession:
 
     def update(
         self,
-        frame: InferenceSourceItem | object,
+        frame: SourceItem | PreparedTensorInput | object,
         source_key: str | None = None,
-        imgsz: int | tuple[int, int] | list[int] | None = None,
+        imgsz: ImageSizeLike | None = None,
         conf: float = 0.25,
         iou: float = 0.45,
         max_det: int | None = None,
@@ -193,6 +207,8 @@ class YOLOETrackerSession:
         original_image: SourceItem | object | None = None,
         path: str | None = None,
     ) -> Results:
+        from .inputs import normalize_single_inference_source
+
         self._reset_if_needed(source_key)
         item = normalize_single_inference_source(
             frame,

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 try:
+    import tomllib
     from tomllib import TOMLDecodeError
 except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
     from tomli import TOMLDecodeError
-
-from ._project_metadata import load_project_version as _load_project_version
 
 
 def normalize_expected_version(value: str | None) -> str | None:
@@ -24,10 +25,22 @@ def normalize_expected_version(value: str | None) -> str | None:
 
 
 def load_project_version(pyproject_path: str | Path) -> str:
+    path = Path(pyproject_path)
     try:
-        return _load_project_version(pyproject_path)
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
     except TOMLDecodeError as exc:
         raise ValueError(f"Unable to parse project metadata from '{pyproject_path}'") from exc
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Unable to find a project version in '{pyproject_path}'")
+
+    project = data.get("project")
+    if not isinstance(project, Mapping):
+        raise ValueError(f"Unable to find a project version in '{pyproject_path}'")
+
+    version = project.get("version")
+    if not isinstance(version, str):
+        raise ValueError(f"Unable to find a project version in '{pyproject_path}'")
+    return version
 
 
 def changelog_has_version(changelog_path: str | Path, version: str) -> bool:

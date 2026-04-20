@@ -11,14 +11,14 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 ```
 
-`requirements-dev.txt` includes the repo's editable install plus the current VCS-only Ultralytics CLIP dependency that runtime text prompting needs.
+`requirements-dev.txt` includes the repo's editable install plus the VCS Ultralytics CLIP dependency used by runtime text prompting.
 
 ## Native install notes
 
-The editable install above is the normal contributor path. If you only need docs or lightweight checks and do not have TensorRT headers/libs available:
+The editable install above is the contributor path. If you only need docs or lightweight checks and do not have TensorRT headers/libs available:
 
 ```bash
-python -m pip install ".[dev,export,gui,docs]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
+python -m pip install ".[all]" --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
 ```
 
 ## Fast verification
@@ -57,7 +57,7 @@ python -m pytest -s -o log_cli=true --log-cli-level=INFO \
 ## Performance checks
 
 The public API is unified around `YOLOEEngine.predict(...)` and `YOLOEEngine.track(...)`, but the lowest-overhead headless
-route is still the prepared-tensor path returned by `YOLOEEngine.prepare_cuda_input(...)`. Benchmark host-image vs
+route is the prepared-tensor path returned by `YOLOEEngine.prepare_cuda_input(...)`. Benchmark host-image vs
 prepared-tensor inference with JSON output under `outputs/benchmarks/`:
 
 ```bash
@@ -93,7 +93,6 @@ The full benchmark matrix, including text-prompt and visual-prompt update costs,
 - Public CI runs Ruff, runner-safe unit tests, docs validation, sdist builds, and clean install smoke tests.
 - Required public CI does not assume CUDA, TensorRT headers, or a self-hosted Jetson runner.
 - Tag pushes like `vX.Y.Z` trigger the release scaffold, which verifies the version and changelog before uploading source artifacts.
-- GPU and Jetson-specific validation remain a future optional self-hosted workflow.
 
 ## Output conventions
 

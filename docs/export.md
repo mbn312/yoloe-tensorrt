@@ -13,9 +13,9 @@ yoloe-export yoloe-26s-seg.pt --artifact-dir outputs/artifacts/yoloe26s --fixed 
 
 ## Exporter modes
 
-- `--exporter auto`: default. On newer torch builds, tries the dynamo ONNX exporter first and falls back to the legacy exporter if YOLOE tracing fails.
-- `--exporter legacy`: forces the older `torch.onnx.export` path. This is the most conservative compatibility option.
-- `--exporter dynamo`: forces the newer dynamo-based exporter. Use this for debugging or when validating a newer torch environment.
+- `--exporter auto`: default. Tries the dynamo ONNX exporter first and falls back to the legacy exporter if YOLOE tracing fails.
+- `--exporter legacy`: forces the `torch.onnx.export` path. This is the most conservative compatibility option.
+- `--exporter dynamo`: forces the dynamo-based exporter. Use this for debugging or exporter compatibility checks.
 
 The default opset is exporter-specific:
 

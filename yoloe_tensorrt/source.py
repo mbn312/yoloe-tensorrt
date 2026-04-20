@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TypeAlias
 
 import cv2
 import numpy as np
 from PIL import Image
 
+from ._shapes import HWShape, normalize_hw_shape
 from .logging_utils import get_logger
 
 LOGGER = get_logger(__name__)
@@ -21,14 +22,14 @@ class SourceItem:
 
 @dataclass(frozen=True)
 class PreparedFrameMetadata:
-    original_shape: tuple[int, int]
+    original_shape: HWShape
     path: str | None = None
     preview_image: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        height = int(self.original_shape[0])
-        width = int(self.original_shape[1])
-        object.__setattr__(self, "original_shape", (height, width))
+        normalized_shape = normalize_hw_shape(self.original_shape, name="original_shape")
+        object.__setattr__(self, "original_shape", normalized_shape)
+        height, width = self.original_shape
         if height <= 0 or width <= 0:
             raise ValueError("Prepared frame metadata requires a positive (height, width) original_shape")
         if self.preview_image is not None:
@@ -45,6 +46,9 @@ class PreparedFrameMetadata:
 class SourceStream(Iterable[SourceItem]):
     is_live_source: bool = False
     max_frames: int | None = None
+
+
+OriginalImageReference: TypeAlias = SourceItem | PreparedFrameMetadata | object | None
 
 
 def _pil_to_bgr(image: Image.Image) -> np.ndarray:

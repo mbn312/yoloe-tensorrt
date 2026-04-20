@@ -62,6 +62,17 @@ class _FakeEngine:
         return self._results[index]
 
 
+def _tracker_output(track_id: float = 5.0) -> np.ndarray:
+    return np.asarray([[1.0, 2.0, 10.0, 11.0, track_id, 0.9, 0.0, 0.0]], dtype=np.float32)
+
+
+def _patch_tracker_backend(monkeypatch: pytest.MonkeyPatch, outputs: list[np.ndarray]) -> None:
+    def _fake_build_backend(_tracker: str, _config: dict, _frame_rate: int) -> _FakeTrackerBackend:
+        return _FakeTrackerBackend(outputs)
+
+    monkeypatch.setattr("yoloe_tensorrt.tracking._build_tracker_backend", _fake_build_backend)
+
+
 def test_resolve_tracker_config_supports_dict_and_yaml_overrides(tmp_path: Path) -> None:
     config = resolve_tracker_config("bytetrack", {"track_buffer": 42})
     assert config["tracker_type"] == "bytetrack"
@@ -145,14 +156,7 @@ def test_tracker_session_resets_on_prompt_generation_and_source_change(monkeypat
 
 
 def test_tracker_session_accepts_prepared_tensor_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_build_backend(_tracker: str, _config: dict, _frame_rate: int) -> _FakeTrackerBackend:
-        return _FakeTrackerBackend(
-            [
-                np.asarray([[1.0, 2.0, 10.0, 11.0, 5.0, 0.9, 0.0, 0.0]], dtype=np.float32),
-            ]
-        )
-
-    monkeypatch.setattr("yoloe_tensorrt.tracking._build_tracker_backend", _fake_build_backend)
+    _patch_tracker_backend(monkeypatch, [_tracker_output()])
     engine = _FakeEngine([_make_result()])
     session = YOLOETrackerSession(engine)
 
@@ -170,14 +174,7 @@ def test_tracker_session_accepts_prepared_tensor_inputs(monkeypatch: pytest.Monk
 
 
 def test_tracker_session_uses_engine_default_max_det(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_build_backend(_tracker: str, _config: dict, _frame_rate: int) -> _FakeTrackerBackend:
-        return _FakeTrackerBackend(
-            [
-                np.asarray([[1.0, 2.0, 10.0, 11.0, 5.0, 0.9, 0.0, 0.0]], dtype=np.float32),
-            ]
-        )
-
-    monkeypatch.setattr("yoloe_tensorrt.tracking._build_tracker_backend", _fake_build_backend)
+    _patch_tracker_backend(monkeypatch, [_tracker_output()])
     engine = _FakeEngine([_make_result()])
     session = YOLOETrackerSession(engine)
 

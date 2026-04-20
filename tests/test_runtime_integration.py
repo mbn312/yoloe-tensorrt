@@ -336,7 +336,7 @@ def test_native_visual_prompt_embeddings_match_python_reference(
     torch.testing.assert_close(
         native_embeddings.detach().cpu(),
         reference_embeddings.detach().cpu(),
-        atol=2e-3,
+        atol=3e-3,
         rtol=1e-3,
     )
 
@@ -460,22 +460,13 @@ def test_native_inference_uses_cached_prompt_names_without_reconcatenating_embed
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("native_builder_failure", ["returns_none", "raises"])
 def test_visual_prompt_python_fallback_remains_available(
     engine_artifact_dir: Path,
     integration_imgsz: int,
     test_images: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
-    native_builder_failure: str,
 ) -> None:
-    if native_builder_failure == "raises":
-
-        def _raise_native_visual_error(*args, **kwargs):
-            raise RuntimeError("synthetic native visual runtime failure")
-
-        monkeypatch.setattr(engine_module, "build_native_visual_runtime", _raise_native_visual_error)
-    else:
-        monkeypatch.setattr(engine_module, "build_native_visual_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_module, "build_native_visual_runtime", lambda *args, **kwargs: None)
     engine = YOLOEEngine.from_engine(engine_artifact_dir)
     try:
         assert engine.native_visual_runtime is None

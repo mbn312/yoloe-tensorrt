@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 import torch
+import yoloe_tensorrt.gstreamer as gstreamer_module
 from yoloe_tensorrt import (
     JetsonZeroCopySource,
     build_dummy_video_pipeline,
@@ -14,6 +17,21 @@ from yoloe_tensorrt import (
 )
 from yoloe_tensorrt.inputs import PreparedTensorInput
 from yoloe_tensorrt.source import SourceItem, SourceStream
+
+
+def test_require_gst_propagates_unexpected_import_setup_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeGi:
+        @staticmethod
+        def require_version(_name: str, _version: str) -> None:
+            raise KeyError("broken gi setup")
+
+    monkeypatch.setattr(gstreamer_module, "_GST", None)
+    monkeypatch.setattr(gstreamer_module, "_GST_APP", None)
+    monkeypatch.setattr(gstreamer_module, "_GST_VIDEO", None)
+    monkeypatch.setitem(sys.modules, "gi", _FakeGi())
+
+    with pytest.raises(KeyError, match="broken gi setup"):
+        gstreamer_module._require_gst()
 
 
 def test_build_usb_camera_pipeline_defaults_to_mjpeg_bgr_appsink() -> None:
@@ -289,4 +307,41 @@ def test_jetson_zero_copy_source_falls_back_when_no_first_frame(monkeypatch: pyt
 
     assert len(items) == 1
     assert items[0].path == "fallback_frame"
+    assert fake_source.closed is True
+
+
+def test_jetson_zero_copy_source_propagates_unexpected_startup_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeNativeSource:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def read_frame(self):
+            raise KeyError("unexpected frame metadata failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FallbackSource(SourceStream):
+        def __iter__(self):
+            yield SourceItem(image=np.zeros((4, 5, 3), dtype=np.uint8), path="fallback_frame")
+
+    fake_source = _FakeNativeSource()
+    monkeypatch.setattr(
+        "yoloe_tensorrt.gstreamer.build_native_jetson_camera_source",
+        lambda *args, **kwargs: fake_source,
+    )
+
+    source = JetsonZeroCopySource(
+        pipeline="fake-pipeline",
+        prefix="zc",
+        target_imgsz=(320, 320),
+        fp16=False,
+        max_frames=1,
+        fallback_source=_FallbackSource(),
+        required=False,
+    )
+
+    with pytest.raises(KeyError, match="unexpected frame metadata failure"):
+        list(source)
+
     assert fake_source.closed is True

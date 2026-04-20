@@ -249,9 +249,9 @@ possible to trace the artifact back to the run directory and selected checkpoint
 
 Fine-tuning changes the model weights. It does not remove or replace the package's runtime prompt workflow.
 
-- Exported fine-tuned bundles still support `engine.set_classes(...)`.
-- Exported fine-tuned bundles still support `engine.set_visual_prompts(...)` when the visual engine is present.
-- Training dataset class names are not automatically activated as runtime labels; your application still chooses the
+- Exported fine-tuned bundles support `engine.set_classes(...)`.
+- Exported fine-tuned bundles support `engine.set_visual_prompts(...)` when the visual engine is present.
+- Training dataset class names are not automatically activated as runtime labels; your application chooses the
   active prompt set at inference time.
 
 See [Runtime Prompts](prompts.md) for the prompt APIs themselves.

@@ -31,7 +31,7 @@ result = engine.predict(prepared)[0]
 print(result.speed)
 ```
 
-If you already have a model-ready tensor, keep using the same public API and mark it explicitly:
+If you already have a model-ready tensor, pass it through the same public API and mark it explicitly:
 
 ```python
 result = engine.predict(

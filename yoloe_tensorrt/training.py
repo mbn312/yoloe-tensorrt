@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 
+from ._shapes import HWShape, ImageSizeLike
 from .datasets import DatasetConfig, DatasetTask, validate_dataset_config
 
 _CONFLICTING_OVERRIDE_KEYS = frozenset(
@@ -27,6 +29,51 @@ _SUPPORTED_EXPORT_CHECKPOINTS = {"best", "last"}
 ExportCheckpoint = Literal["best", "last"]
 OnnxExporterMode = Literal["auto", "legacy", "dynamo"]
 
+UltralyticsOverrideScalar: TypeAlias = str | int | float | bool | None | Path
+UltralyticsOverrideValue: TypeAlias = (
+    UltralyticsOverrideScalar
+    | list["UltralyticsOverrideValue"]
+    | tuple["UltralyticsOverrideValue", ...]
+    | dict[str, "UltralyticsOverrideValue"]
+)
+TrainingMetadataValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | list["TrainingMetadataValue"]
+    | tuple["TrainingMetadataValue", ...]
+    | dict[str | int, "TrainingMetadataValue"]
+)
+TrainingMetadata: TypeAlias = dict[str, TrainingMetadataValue]
+
+if TYPE_CHECKING:
+    import torch
+    from ultralytics.utils.metrics import DetMetrics, SegmentMetrics
+
+    TrainingDevice: TypeAlias = str | int | torch.device | list[int] | tuple[int, ...] | None
+    TrainingMetrics: TypeAlias = DetMetrics | SegmentMetrics | None
+else:
+    TrainingDevice: TypeAlias = str | int | list[int] | tuple[int, ...] | None
+    TrainingMetrics: TypeAlias = object | None
+
+
+class _UltralyticsTrainer(Protocol):
+    save_dir: str | Path
+    best: str | Path | None
+    last: str | Path | None
+
+
+class _UltralyticsModel(Protocol):
+    trainer: _UltralyticsTrainer | None
+
+    def train(self, **kwargs: UltralyticsOverrideValue) -> TrainingMetrics: ...
+
+
+class _UltralyticsModelFactory(Protocol):
+    def __call__(self, model: str | Path, task: DatasetTask | None = None) -> _UltralyticsModel: ...
+
 
 class TrainingError(RuntimeError):
     """Raised when Ultralytics training completes without expected run artifacts."""
@@ -37,7 +84,7 @@ class TrainingResult:
     checkpoint_path: Path
     run_dir: Path
     metrics_path: Path | None
-    metadata: dict[str, Any]
+    metadata: TrainingMetadata
     best_checkpoint_path: Path | None = None
     last_checkpoint_path: Path | None = None
     artifact_dir: Path | None = None
@@ -53,7 +100,7 @@ class _PostTrainExportRequest:
     dynamic: bool
     build_visual_engine: bool
     fp16: bool
-    imgsz: int | tuple[int, int] | list[int] | None
+    imgsz: ImageSizeLike | None
     max_det: int
     overwrite: bool
     workspace_bytes: int
@@ -66,13 +113,13 @@ class _TrainingRequest:
     model_path: str
     dataset_path: Path
     task: DatasetTask
-    imgsz: int | tuple[int, int]
+    imgsz: int | HWShape
     epochs: int
     batch: int | float | str
-    device: Any
+    device: TrainingDevice
     output_path: Path
     name: str | None
-    overrides: dict[str, Any]
+    overrides: dict[str, UltralyticsOverrideValue]
     dataset: DatasetConfig | None
     exist_ok: bool
     export: _PostTrainExportRequest
@@ -92,13 +139,13 @@ def train_model(
     dataset_config: str | Path,
     *,
     task: DatasetTask = "detect",
-    imgsz: int | tuple[int, int] = 640,
+    imgsz: int | HWShape = 640,
     epochs: int = 100,
     batch: int | float | str = 16,
-    device: Any = None,
+    device: TrainingDevice = None,
     output_dir: str | Path = "outputs/training",
     name: str | None = None,
-    overrides: Mapping[str, Any] | None = None,
+    overrides: Mapping[str, UltralyticsOverrideValue] | None = None,
     validate_dataset: bool = True,
     exist_ok: bool = False,
     export_artifact: bool = False,
@@ -108,7 +155,7 @@ def train_model(
     export_dynamic: bool = True,
     export_build_visual_engine: bool = True,
     export_fp16: bool = True,
-    export_imgsz: int | tuple[int, int] | list[int] | None = None,
+    export_imgsz: ImageSizeLike | None = None,
     export_max_det: int = 300,
     export_overwrite: bool = True,
     export_workspace_bytes: int = 2 << 30,
@@ -183,13 +230,13 @@ def _build_training_request(
     model_checkpoint: str | Path,
     dataset_config: str | Path,
     task: DatasetTask,
-    imgsz: int | tuple[int, int],
+    imgsz: int | HWShape,
     epochs: int,
     batch: int | float | str,
-    device: Any,
+    device: TrainingDevice,
     output_dir: str | Path,
     name: str | None,
-    overrides: Mapping[str, Any] | None,
+    overrides: Mapping[str, UltralyticsOverrideValue] | None,
     validate_dataset: bool,
     exist_ok: bool,
     export_artifact: bool,
@@ -199,7 +246,7 @@ def _build_training_request(
     export_dynamic: bool,
     export_build_visual_engine: bool,
     export_fp16: bool,
-    export_imgsz: int | tuple[int, int] | list[int] | None,
+    export_imgsz: ImageSizeLike | None,
     export_max_det: int,
     export_overwrite: bool,
     export_workspace_bytes: int,
@@ -242,8 +289,8 @@ def _build_training_request(
     )
 
 
-def _run_training(request: _TrainingRequest) -> tuple[Any, Any]:
-    train_kwargs: dict[str, Any] = {
+def _run_training(request: _TrainingRequest) -> tuple[TrainingMetrics, _UltralyticsTrainer]:
+    train_kwargs: dict[str, UltralyticsOverrideValue] = {
         "data": str(request.dataset_path),
         "task": request.task,
         "imgsz": request.imgsz,
@@ -267,7 +314,7 @@ def _run_training(request: _TrainingRequest) -> tuple[Any, Any]:
     return metrics, trainer
 
 
-def _resolve_training_artifacts(trainer: Any) -> _TrainingArtifacts:
+def _resolve_training_artifacts(trainer: _UltralyticsTrainer) -> _TrainingArtifacts:
     run_dir = _resolve_run_dir(trainer)
     best_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "best")
     last_checkpoint_path = _resolve_named_checkpoint_path(trainer, run_dir, "last")
@@ -284,7 +331,7 @@ def _export_training_artifact(
     *,
     request: _TrainingRequest,
     artifacts: _TrainingArtifacts,
-    metadata: Mapping[str, Any],
+    metadata: Mapping[str, TrainingMetadataValue],
 ) -> tuple[Path | None, Path | None]:
     if not request.export.enabled:
         return None, None
@@ -329,7 +376,7 @@ def _export_training_artifact(
     return artifact_dir, exported_checkpoint_path
 
 
-def _load_yoloe_class() -> Any:
+def _load_yoloe_class() -> _UltralyticsModelFactory:
     from ultralytics import YOLOE
 
     return YOLOE
@@ -354,7 +401,9 @@ def _normalize_dataset_config_path(dataset_config: str | Path) -> Path:
     return Path(dataset_config).expanduser()
 
 
-def _normalize_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
+def _normalize_overrides(
+    overrides: Mapping[str, UltralyticsOverrideValue] | None,
+) -> dict[str, UltralyticsOverrideValue]:
     if overrides is None:
         return {}
     if not isinstance(overrides, Mapping):
@@ -377,14 +426,18 @@ def _normalize_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
     return dict(overrides)
 
 
-def _resolve_run_dir(trainer: Any) -> Path:
+def _resolve_run_dir(trainer: _UltralyticsTrainer) -> Path:
     raw_save_dir = getattr(trainer, "save_dir", None)
     if raw_save_dir is None:
         raise TrainingError("Ultralytics trainer did not expose a save_dir.")
     return Path(raw_save_dir).expanduser().resolve(strict=False)
 
 
-def _resolve_named_checkpoint_path(trainer: Any, run_dir: Path, checkpoint_name: ExportCheckpoint) -> Path | None:
+def _resolve_named_checkpoint_path(
+    trainer: _UltralyticsTrainer,
+    run_dir: Path,
+    checkpoint_name: ExportCheckpoint,
+) -> Path | None:
     path = _optional_path(getattr(trainer, checkpoint_name, None), base_dir=run_dir)
     if path is not None and path.exists():
         return path.resolve()
@@ -435,8 +488,10 @@ def _resolve_metrics_path(run_dir: Path) -> Path | None:
     return None
 
 
-def _optional_path(value: Any, *, base_dir: Path) -> Path | None:
-    if value is None or value is False or value == "":
+def _optional_path(value: str | Path | None | Literal[False], *, base_dir: Path) -> Path | None:
+    if value is None or value is False:
+        return None
+    if isinstance(value, str) and not value:
         return None
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -450,36 +505,36 @@ def _build_training_metadata(
     dataset_path: Path,
     dataset: DatasetConfig | None,
     task: DatasetTask,
-    imgsz: int | tuple[int, int],
+    imgsz: int | HWShape,
     epochs: int,
     batch: int | float | str,
-    device: Any,
+    device: TrainingDevice,
     output_path: Path,
     name: str | None,
     exist_ok: bool,
-    overrides: Mapping[str, Any],
-    metrics: Any,
-) -> dict[str, Any]:
+    overrides: Mapping[str, UltralyticsOverrideValue],
+    metrics: TrainingMetrics,
+) -> TrainingMetadata:
     return {
         "model_checkpoint": model_checkpoint,
         "dataset_config": str(dataset_path),
         "dataset": _dataset_metadata(dataset),
         "task": task,
-        "imgsz": imgsz,
+        "imgsz": _normalize_metadata_value(imgsz),
         "epochs": epochs,
-        "batch": batch,
-        "device": device,
+        "batch": _normalize_metadata_value(batch),
+        "device": _normalize_metadata_value(device),
         "output_dir": str(output_path),
         "name": name,
         "exist_ok": exist_ok,
-        "overrides": dict(overrides),
+        "overrides": _normalize_metadata_value(dict(overrides)),
         "metrics_type": None if metrics is None else type(metrics).__name__,
     }
 
 
 def _build_export_training_metadata(
     *,
-    metadata: Mapping[str, Any],
+    metadata: Mapping[str, TrainingMetadataValue],
     run_dir: Path,
     metrics_path: Path | None,
     checkpoint_path: Path,
@@ -487,8 +542,8 @@ def _build_export_training_metadata(
     last_checkpoint_path: Path | None,
     export_checkpoint: ExportCheckpoint,
     exported_checkpoint_path: Path,
-) -> dict[str, Any]:
-    export_metadata = dict(metadata)
+) -> TrainingMetadata:
+    export_metadata: TrainingMetadata = dict(metadata)
     export_metadata["run_dir"] = str(run_dir)
     export_metadata["metrics_path"] = None if metrics_path is None else str(metrics_path)
     export_metadata["checkpoint_path"] = str(checkpoint_path)
@@ -499,7 +554,7 @@ def _build_export_training_metadata(
     return export_metadata
 
 
-def _dataset_metadata(dataset: DatasetConfig | None) -> dict[str, Any] | None:
+def _dataset_metadata(dataset: DatasetConfig | None) -> TrainingMetadata | None:
     if dataset is None:
         return None
     return {
@@ -509,3 +564,25 @@ def _dataset_metadata(dataset: DatasetConfig | None) -> dict[str, Any] | None:
         "val_image_count": dataset.val.image_count,
         "test_image_count": None if dataset.test is None else dataset.test.image_count,
     }
+
+
+def _normalize_metadata_value(
+    value: UltralyticsOverrideValue | TrainingDevice | dict[int | str, str],
+) -> TrainingMetadataValue:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path) or _is_torch_device(value):
+        return str(value)
+    if isinstance(value, list):
+        return [_normalize_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_metadata_value(item) for item in value)
+    return {_normalize_metadata_key(key): _normalize_metadata_value(item) for key, item in value.items()}
+
+
+def _normalize_metadata_key(key: int | str) -> int | str:
+    return key if isinstance(key, int) and not isinstance(key, bool) else str(key)
+
+
+def _is_torch_device(value: UltralyticsOverrideValue | TrainingDevice | dict[int | str, str]) -> bool:
+    return value.__class__.__module__ == "torch" and value.__class__.__name__ == "device"

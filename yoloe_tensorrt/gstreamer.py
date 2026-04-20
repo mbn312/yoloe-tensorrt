@@ -9,7 +9,7 @@ from torch.utils.dlpack import from_dlpack
 from ._camera_spec import is_rtsp_uri as _is_rtsp_uri
 from ._camera_spec import parse_camera_source_spec
 from ._inference_types import prepare_tensor_input
-from ._shapes import normalize_imgsz
+from ._shapes import HWShape, ImageSizeLike, normalize_imgsz
 from .logging_utils import get_logger
 from .native_backend import JETSON_ZERO_COPY_AVAILABLE, build_native_jetson_camera_source
 from .source import PreparedFrameMetadata, SourceItem, SourceStream
@@ -33,7 +33,7 @@ def _require_gst():
         gi.require_version("GstApp", "1.0")
         gi.require_version("GstVideo", "1.0")
         from gi.repository import Gst, GstApp, GstVideo
-    except Exception as exc:  # pragma: no cover - exercised in integration environments
+    except (ImportError, ValueError) as exc:  # pragma: no cover - exercised in integration environments
         raise RuntimeError(
             "GStreamer Python bindings are required for GStreamer camera input. "
             "Install or expose `gi.repository.Gst` in the runtime environment."
@@ -204,7 +204,7 @@ def camera_source_from_spec(
     max_frames: int | None = None,
     zero_copy: bool | None = None,
     preview_cpu: bool = False,
-    target_imgsz: int | tuple[int, int] | list[int] | None = None,
+    target_imgsz: ImageSizeLike | None = None,
     fp16: bool = False,
     device: str | int = "cuda:0",
 ) -> SourceStream:
@@ -425,7 +425,7 @@ class GStreamerSource(SourceStream):
 class JetsonZeroCopySource(SourceStream):
     pipeline: str
     prefix: str
-    target_imgsz: tuple[int, int]
+    target_imgsz: HWShape
     fp16: bool
     preview_cpu: bool = False
     max_frames: int | None = None
@@ -459,11 +459,41 @@ class JetsonZeroCopySource(SourceStream):
         LOGGER.info("Opening Jetson zero-copy source '%s' with pipeline: %s", self.prefix, self.pipeline)
         frame_index = 0
         yielded_any = False
+        native_source_closed = False
+
+        def _close_native_source() -> None:
+            nonlocal native_source_closed
+            if native_source_closed:
+                return
+            native_source.close()
+            native_source_closed = True
+
         try:
             while self.max_frames is None or frame_index < self.max_frames:
-                frame = native_source.read_frame()
+                try:
+                    frame = native_source.read_frame()
+                except (RuntimeError, OSError):
+                    _close_native_source()
+                    if not yielded_any and self.fallback_source is not None and not self.required:
+                        LOGGER.warning(
+                            "Zero-copy startup failed for '%s'; falling back to CPU appsink path",
+                            self.prefix,
+                            exc_info=True,
+                        )
+                        yield from self.fallback_source
+                        return
+                    raise
                 if frame is None:
                     if not yielded_any:
+                        _close_native_source()
+                        if self.fallback_source is not None and not self.required:
+                            LOGGER.warning(
+                                "Zero-copy source reached EOS before the first frame for '%s'; "
+                                "falling back to CPU appsink path",
+                                self.prefix,
+                            )
+                            yield from self.fallback_source
+                            return
                         raise RuntimeError("Zero-copy source reached EOS before yielding the first frame")
                     break
                 yielded_any = True
@@ -481,19 +511,8 @@ class JetsonZeroCopySource(SourceStream):
                     producer_stream=int(frame["producer_stream"]),
                 )
                 frame_index += 1
-        except Exception:
-            native_source.close()
-            if not yielded_any and self.fallback_source is not None and not self.required:
-                LOGGER.warning(
-                    "Zero-copy startup failed for '%s'; falling back to CPU appsink path",
-                    self.prefix,
-                    exc_info=True,
-                )
-                yield from self.fallback_source
-                return
-            raise
         finally:
-            native_source.close()
+            _close_native_source()
             LOGGER.info("Closed Jetson zero-copy source '%s'", self.prefix)
 
 

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any
+from typing import TypeAlias, cast
 
 import yaml
+
+from ._shapes import HWShape
+
+YamlValue: TypeAlias = (
+    str | int | float | bool | None | list["YamlValue"] | tuple["YamlValue", ...] | dict[str, "YamlValue"]
+)
 
 
 def parse_positive_int(value: str, option_name: str) -> int:
@@ -16,7 +22,7 @@ def parse_positive_int(value: str, option_name: str) -> int:
     return parsed
 
 
-def parse_imgsz(value: str, option_name: str = "--imgsz") -> int | tuple[int, int]:
+def parse_imgsz(value: str, option_name: str = "--imgsz") -> int | HWShape:
     raw_value = value.strip().lower()
     if not raw_value:
         raise argparse.ArgumentTypeError(f"{option_name} must not be empty.")
@@ -31,9 +37,9 @@ def parse_imgsz(value: str, option_name: str = "--imgsz") -> int | tuple[int, in
     return parse_positive_int(raw_value, option_name)
 
 
-def load_yaml_value(value: str) -> Any:
+def load_yaml_value(value: str) -> YamlValue:
     try:
-        return yaml.safe_load(value)
+        return cast(YamlValue, yaml.safe_load(value))
     except yaml.YAMLError as exc:
         raise argparse.ArgumentTypeError(f"could not parse YAML scalar {value!r}: {exc}") from exc
 
@@ -43,8 +49,8 @@ def parse_key_value_args(
     *,
     option_name: str,
     error_type: type[Exception] = ValueError,
-) -> dict[str, Any]:
-    values: dict[str, Any] = {}
+) -> dict[str, YamlValue]:
+    values: dict[str, YamlValue] = {}
     for entry in entries or []:
         if "=" not in entry:
             raise error_type(f"{option_name} must use KEY=VALUE syntax.")

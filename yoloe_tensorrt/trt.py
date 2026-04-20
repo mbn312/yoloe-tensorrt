@@ -2,17 +2,31 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Protocol
 
 import numpy as np
 import torch
 
+from ._shapes import TensorProfileShape, TensorShape
 from .artifacts import ShapeProfile
 from .logging_utils import get_logger
 
 LOGGER = get_logger(__name__)
+
+
+class _Stringifiable(Protocol):
+    def __str__(self) -> str: ...
+
+
+class _OnnxParserProtocol(Protocol):
+    num_errors: int
+
+    def parse(self, payload: bytes) -> bool: ...
+
+    def get_error(self, index: int) -> _Stringifiable: ...
 
 
 def _numpy_to_torch_dtype(dtype: np.dtype) -> torch.dtype:
@@ -37,7 +51,7 @@ class TensorBinding:
     is_input: bool
     dtype: np.dtype
     torch_dtype: torch.dtype
-    shape: tuple[int, ...]
+    shape: TensorShape
     profile_shape: ShapeProfile | None
 
 
@@ -140,40 +154,50 @@ class TensorRTRuntime:
     def _trt10_binding_dtype(self, index: int) -> np.dtype:
         return np.dtype(self.trt.nptype(self.engine.get_tensor_dtype(self.engine.get_tensor_name(index))))
 
-    def _trt10_binding_shape(self, index: int) -> tuple[int, ...]:
+    def _trt10_binding_shape(self, index: int) -> TensorShape:
         return tuple(int(v) for v in self.engine.get_tensor_shape(self.engine.get_tensor_name(index)))
 
-    def _trt10_binding_profile(self, index: int):
-        return self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(index), 0)
+    def _trt10_binding_profile(self, index: int) -> TensorProfileShape:
+        minimum, optimum, maximum = self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(index), 0)
+        return (
+            tuple(int(v) for v in minimum),
+            tuple(int(v) for v in optimum),
+            tuple(int(v) for v in maximum),
+        )
 
     def _trt8_binding_dtype(self, index: int) -> np.dtype:
         return np.dtype(self.trt.nptype(self.engine.get_binding_dtype(index)))
 
-    def _trt8_binding_shape(self, index: int) -> tuple[int, ...]:
+    def _trt8_binding_shape(self, index: int) -> TensorShape:
         return tuple(int(v) for v in self.engine.get_binding_shape(index))
 
-    def _trt8_binding_profile(self, index: int):
-        return self.engine.get_profile_shape(0, index)
+    def _trt8_binding_profile(self, index: int) -> TensorProfileShape:
+        minimum, optimum, maximum = self.engine.get_profile_shape(0, index)
+        return (
+            tuple(int(v) for v in minimum),
+            tuple(int(v) for v in optimum),
+            tuple(int(v) for v in maximum),
+        )
 
-    def _set_binding_shape(self, name: str, shape: tuple[int, ...]) -> None:
+    def _set_binding_shape(self, name: str, shape: TensorShape) -> None:
         self.context.set_binding_shape(self.bindings[name].index, shape)
 
-    def _get_binding_shape(self, name: str):
+    def _get_binding_shape(self, name: str) -> Sequence[int]:
         return self.context.get_binding_shape(self.bindings[name].index)
 
-    def _execute_async(self, binding_addrs: list[int], stream) -> bool:
+    def _execute_async(self, binding_addrs: list[int], stream: torch.cuda.Stream) -> bool:
         return bool(self.context.execute_async_v2(binding_addrs, stream.cuda_stream))
 
-    def _execute_sync(self, binding_addrs: list[int], _stream) -> bool:
+    def _execute_sync(self, binding_addrs: list[int], _stream: torch.cuda.Stream) -> bool:
         return bool(self.context.execute_v2(binding_addrs))
 
-    def _set_input_shape(self, name: str, shape: tuple[int, ...]) -> None:
+    def _set_input_shape(self, name: str, shape: TensorShape) -> None:
         self._set_context_shape(name, shape)
 
-    def _get_tensor_shape(self, name: str) -> tuple[int, ...]:
+    def _get_tensor_shape(self, name: str) -> TensorShape:
         return tuple(int(v) for v in self._get_context_shape(name))
 
-    def _profile_shape(self, name: str) -> tuple[int, ...]:
+    def _profile_shape(self, name: str) -> TensorShape:
         binding = self.bindings[name]
         if binding.profile_shape is not None:
             return binding.profile_shape.optimum
@@ -228,7 +252,7 @@ class TensorRTRuntime:
         )
         return outputs
 
-    def warmup(self, shapes: Mapping[str, tuple[int, ...]] | None = None, runs: int = 2) -> None:
+    def warmup(self, shapes: Mapping[str, TensorShape] | None = None, runs: int = 2) -> None:
         LOGGER.info("Warming up TensorRT engine '%s' for %d run(s)", self.engine_path.name, runs)
         inputs = {}
         for name in self.input_names:
@@ -240,7 +264,7 @@ class TensorRTRuntime:
         LOGGER.info("Warmup complete for '%s'", self.engine_path.name)
 
 
-def _parse_onnx_network(parser: object, onnx_path: Path) -> bool:
+def _parse_onnx_network(parser: _OnnxParserProtocol, onnx_path: Path) -> bool:
     parse_from_file = getattr(parser, "parse_from_file", None)
     if callable(parse_from_file):
         return bool(parse_from_file(str(onnx_path)))

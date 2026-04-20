@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import subprocess
-import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +10,11 @@ from yoloe_tensorrt import train_cli
 from yoloe_tensorrt.datasets import DatasetValidationError
 from yoloe_tensorrt.training import TrainingError, TrainingResult
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
-def test_train_cli_displays_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "yoloe_tensorrt", "train", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
+def test_train_cli_displays_help(
+    run_python_help: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_python_help(["-m", "yoloe_tensorrt", "train"])
 
     assert result.returncode == 0
     assert "Train or fine-tune a YOLOE checkpoint through Ultralytics." in result.stdout

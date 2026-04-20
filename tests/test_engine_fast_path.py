@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yoloe_tensorrt.engine as engine_module
 from ultralytics.engine.results import Results
 from yoloe_tensorrt.engine import YOLOEEngine
 from yoloe_tensorrt.inputs import PreparedTensorInput
@@ -56,6 +58,76 @@ def test_active_names_uses_prompt_name_cache_without_embedding_concat() -> None:
 
     assert engine.active_names == ["bus", "person"]
     assert engine._active_names_cache == ("bus", "person")
+
+
+def test_sync_native_prompt_embeddings_clears_native_runtime_without_concat_when_no_prompts() -> None:
+    class _FakeNativeRuntime:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear_prompt_embeddings(self) -> None:
+            self.clear_calls += 1
+
+    fake_runtime = _FakeNativeRuntime()
+    engine = object.__new__(YOLOEEngine)
+    engine.native_main_runtime = fake_runtime
+    engine._text_names = []
+    engine._visual_names = []
+    engine._active_prompt_embeddings = lambda: pytest.fail(  # type: ignore[method-assign]
+        "_sync_native_prompt_embeddings should not concatenate embeddings when no prompt names are active"
+    )
+
+    engine._sync_native_prompt_embeddings()
+
+    assert fake_runtime.clear_calls == 1
+
+
+def test_from_engine_propagates_native_visual_runtime_init_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    (artifact_dir / "main.engine").write_bytes(b"main")
+    (artifact_dir / "visual.engine").write_bytes(b"visual")
+    (artifact_dir / "prompt_projector.ts").write_bytes(b"projector")
+
+    metadata = SimpleNamespace(
+        main_engine_filename="main.engine",
+        visual_engine_filename="visual.engine",
+        prompt_projector_filename="prompt_projector.ts",
+        image_input_name="images",
+        prompt_input_name="prompts",
+        visual_input_name="visual_prompts",
+        visual_stride=32,
+        text_model="mobileclip-b",
+        text_encoder_filename=None,
+        task="detect",
+    )
+
+    monkeypatch.setattr(engine_module, "load_metadata", lambda _artifact_dir: metadata)
+    monkeypatch.setattr(
+        engine_module,
+        "resolve_artifact_file",
+        lambda root, filename: None if not filename else Path(root) / filename,
+    )
+    monkeypatch.setattr(engine_module, "text_asset_search_roots", lambda roots: roots)
+    monkeypatch.setattr(engine_module, "resolve_text_asset_path", lambda _model, _roots: None, raising=False)
+    monkeypatch.setattr(
+        engine_module,
+        "build_native_main_runtime",
+        lambda *args, **kwargs: SimpleNamespace(output_names=("predictions",), fp16=False),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "build_native_visual_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("native visual init failed")),
+    )
+    monkeypatch.setattr(engine_module, "TensorRTRuntime", lambda *args, **kwargs: object())
+    monkeypatch.setattr(engine_module, "load_prompt_projector", lambda *args, **kwargs: object())
+
+    with pytest.raises(RuntimeError, match="native visual init failed"):
+        YOLOEEngine.from_engine(artifact_dir)
 
 
 def test_main_output_names_are_cached_for_native_runtime() -> None:
@@ -117,7 +189,7 @@ def test_prepared_fast_path_forwards_current_cuda_stream() -> None:
         boxes=torch.zeros((0, 6), device="cpu"),
         speed=kwargs["speed"],
     )
-    engine._build_native_legacy_result = lambda **kwargs: Results(  # type: ignore[method-assign]
+    engine._build_native_raw_result = lambda **kwargs: Results(  # type: ignore[method-assign]
         kwargs["original_image"],
         path=kwargs["path"],
         names={0: "bus"},
@@ -239,7 +311,7 @@ def test_prepared_fast_path_skips_current_stream_lookup_when_input_is_already_re
         boxes=torch.zeros((0, 6), device="cpu"),
         speed=kwargs["speed"],
     )
-    engine._build_native_legacy_result = lambda **kwargs: Results(  # type: ignore[method-assign]
+    engine._build_native_raw_result = lambda **kwargs: Results(  # type: ignore[method-assign]
         kwargs["original_image"],
         path=kwargs["path"],
         names={0: "bus"},

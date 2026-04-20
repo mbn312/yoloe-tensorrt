@@ -40,4 +40,4 @@ below the video stream.
 
 On Jetson builds that include the native camera backend, the GUI requests the zero-copy NVMM/EGL/CUDA ingest path
 automatically and only materializes a CPU preview frame for rendering the window. If zero-copy is unavailable or the
-source cannot negotiate the required NVMM pipeline, the GUI falls back to the existing CPU appsink path.
+source cannot negotiate the required NVMM pipeline, the GUI falls back to the CPU appsink path.

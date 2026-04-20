@@ -50,13 +50,15 @@ If you need runtime text-label prompting, also install:
 pip install git+https://github.com/ultralytics/CLIP.git
 ```
 
-## Install from PyPI (Not Implemented Yet)
+## Install from a published package
+
+If your package index publishes `yoloe-tensorrt`, install it with:
 
 ```bash
 pip install "yoloe-tensorrt[export,gui]"
 ```
 
-If you need runtime text-label prompting from a PyPI install, also install:
+If you need runtime text-label prompting from a published-package install, also install:
 
 ```bash
 pip install git+https://github.com/ultralytics/CLIP.git
@@ -88,10 +90,10 @@ The native TensorRT extension builds by default. If you only need docs or lightw
 python -m pip install . --config-settings=cmake.define.YOLOE_TRT_BUILD_NATIVE=OFF
 ```
 
-That mode is not a production deployment mode. It exists for packaging, docs, and limited development workflows.
+Use that mode only for packaging, docs, and limited development workflows.
 
 ## Python dependency notes
 
-- `onnxscript` is required for the export path on newer PyTorch ONNX exporters and is included in the export dependency set.
+- `onnxscript` is required for the dynamo ONNX exporter and is included in the export dependency set.
 - `all` is available as an aggregate extra for the package-managed optional dependency groups.
-- The Ultralytics CLIP tokenizer dependency is currently installed from `git+https://github.com/ultralytics/CLIP.git`, so source-checkout installs use `requirements.txt` / `requirements-dev.txt` and git/PyPI installs need the extra command above when you use runtime text labels.
+- The Ultralytics CLIP tokenizer dependency is installed from `git+https://github.com/ultralytics/CLIP.git`, so source-checkout installs use `requirements.txt` / `requirements-dev.txt` and git or published-package installs need the extra command above when you use runtime text labels.

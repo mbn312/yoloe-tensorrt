@@ -322,7 +322,12 @@ message(STATUS "Found TensorRT library: ${TENSORRT_LIBRARY}")
 message(STATUS "Found CUDA include dirs: ${CUDA_INCLUDE_DIRS}")
 message(STATUS "Found CUDA link dirs: ${CUDA_LINK_DIRECTORIES}")
 
-set(NATIVE_SOURCES src/native/main.cpp)
+set(NATIVE_SOURCES
+  src/native/module.cpp
+  src/native/main_runtime.cpp
+  src/native/visual_runtime.cpp
+  src/native/jetson_camera.cpp
+)
 set(NATIVE_EXTRA_LIBS "")
 set(NATIVE_EXTRA_INCLUDE_DIRS "")
 set(NATIVE_EXTRA_COMPILE_DEFINITIONS "")
@@ -397,11 +402,8 @@ target_link_options(
 target_include_directories(
   _native
   PRIVATE
-<<<<<<< Updated upstream
     ${CUDAToolkit_INCLUDE_DIRS}
-=======
     ${CUDA_INCLUDE_DIRS}
->>>>>>> Stashed changes
     ${TENSORRT_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native
     ${OpenCV_INCLUDE_DIRS}

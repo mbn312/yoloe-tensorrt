@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 import yaml
 import yoloe_tensorrt
 import yoloe_tensorrt.export as export_mod
@@ -502,6 +503,37 @@ def test_train_model_can_skip_dataset_validation(monkeypatch: pytest.MonkeyPatch
 
     assert result.metadata["dataset"] is None
     assert fake_yoloe.instances[0].train_kwargs["data"] == str(dataset_path)
+
+
+def test_train_model_normalizes_metadata_values_for_traceability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_path = _make_dataset_config(tmp_path)
+    run_dir = tmp_path / "runs" / "train"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    (weights_dir / "best.pt").write_bytes(b"best")
+    _install_fake_yoloe(
+        monkeypatch,
+        trainer=SimpleNamespace(save_dir=run_dir, best=weights_dir / "best.pt", last=weights_dir / "last.pt"),
+    )
+
+    result = train_model(
+        "model.pt",
+        dataset_path,
+        device=torch.device("cpu"),
+        overrides={
+            "pretrained": tmp_path / "weights" / "resume.pt",
+            "devices": (0, 1),
+        },
+    )
+
+    assert result.metadata["device"] == "cpu"
+    assert result.metadata["overrides"] == {
+        "pretrained": str(tmp_path / "weights" / "resume.pt"),
+        "devices": (0, 1),
+    }
 
 
 def test_train_model_rejects_mapping_dataset_config() -> None:

@@ -6,7 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 import yoloe_tensorrt.trt as trt_mod
 from yoloe_tensorrt.artifacts import ShapeProfile
 
@@ -175,4 +174,3 @@ def test_build_engine_from_onnx_falls_back_to_model_directory_for_parse_bytes(
     assert parser.parse_calls == [b"onnx"]
     assert state["cwd_during_parse"] == str(model_dir.resolve())
     assert os.getcwd() == original_cwd
-

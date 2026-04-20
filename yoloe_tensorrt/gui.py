@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 import cv2
 from PIL import Image, ImageTk
 
-from ._shapes import normalize_imgsz
+from ._shapes import ImageSizeLike, normalize_imgsz
 from .assets import default_example_model_spec, resolve_model_checkpoint
 from .gstreamer import camera_source_from_spec
 from .logging_utils import configure_logging, get_logger
@@ -42,6 +42,7 @@ DEFAULT_GUI_TRACKING = os.environ.get("YOLOE_TRT_GUI_TRACKING", "1").lower() not
 DEFAULT_GUI_TRACKER = normalize_tracker_name(os.environ.get("YOLOE_TRT_GUI_TRACKER", DEFAULT_TRACKER))
 DEFAULT_GUI_SOURCE_PRESETS = ("videotest://ball",)
 CUSTOM_GUI_SOURCE_OPTION = "Custom..."
+GUI_SOURCE_OPEN_ERRORS = (FileNotFoundError, OSError, RuntimeError, ValueError)
 
 
 def parse_label_text(text: str) -> list[str]:
@@ -788,7 +789,7 @@ def run_camera_gui(
     height: int = DEFAULT_GUI_CAMERA_HEIGHT,
     fps: int = DEFAULT_GUI_CAMERA_FPS,
     timeout_s: float = DEFAULT_GUI_CAMERA_TIMEOUT_S,
-    imgsz: int | tuple[int, int] | list[int] | None = None,
+    imgsz: ImageSizeLike | None = None,
     conf: float = DEFAULT_GUI_CONF,
     iou: float = 0.45,
     max_det: int | None = None,
@@ -876,7 +877,7 @@ def run_camera_gui(
                     prefix=source_prefix,
                     max_frames=max_frames,
                 )
-            except Exception as exc:
+            except GUI_SOURCE_OPEN_ERRORS as exc:
                 LOGGER.warning("Unable to switch GUI source to '%s': %s", new_source_spec, exc)
                 message = f"Unable to open source '{new_source_spec}': {exc}"
                 gui_window.mark_applied(
@@ -905,7 +906,7 @@ def run_camera_gui(
         try:
             current_source = make_source(active_source_spec, prefix=source_prefix, max_frames=max_frames)
             gui_window.mark_applied(active_source_spec, active_labels, active_tracking, active_tracker)
-        except Exception as exc:
+        except GUI_SOURCE_OPEN_ERRORS as exc:
             LOGGER.warning("Unable to open initial GUI source '%s': %s", active_source_spec, exc)
             gui_window.set_status(f"Unable to open source '{active_source_spec}': {exc}")
 

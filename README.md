@@ -1,6 +1,6 @@
 # yoloe-tensorrt
 
-`yoloe-tensorrt` is a Jetson-first TensorRT runtime for Ultralytics YOLOE models with runtime-custom text labels and visual prompts. It exposes a normal Python package API, ships a native C++ TensorRT backend for the main inference hot path, includes a live camera GUI for interactive testing, and can export fine-tuned checkpoints directly into TensorRT artifact bundles.
+`yoloe-tensorrt` is a Jetson-first TensorRT runtime for Ultralytics YOLOE models with runtime-custom text labels and visual prompts. It exposes a Python package API, ships a native C++ TensorRT backend for the main inference hot path, includes a live camera GUI for interactive testing, and can export fine-tuned checkpoints directly into TensorRT artifact bundles.
 
 ## Highlights
 
@@ -18,7 +18,7 @@
 
 - Primary target: Jetson Orin / JetPack-class deployments
 - Also supported: Linux x86_64 with CUDA, TensorRT, and OpenCV available
-- Not currently supported as a production target:
+- Unsupported production targets:
   - CPU-only environments
   - Windows
   - macOS
@@ -54,13 +54,15 @@ If you need runtime text-label prompting, also install the CLIP tokenizer depend
 pip install git+https://github.com/ultralytics/CLIP.git
 ```
 
-Install from PyPI (Not Implemented Yet):
+Install from a published package:
+
+If your package index publishes `yoloe-tensorrt`, install it with:
 
 ```bash
 pip install "yoloe-tensorrt[export,gui]"
 ```
 
-If you need runtime text-label prompting from a PyPI install, also install:
+If you need runtime text-label prompting from a published-package install, also install:
 
 ```bash
 pip install git+https://github.com/ultralytics/CLIP.git
@@ -87,9 +89,9 @@ python -m pip install -r requirements-dev.txt
 Notes:
 
 - `tensorrt` and system OpenCV are intentionally not hard-pinned as mandatory pip dependencies because Jetson environments commonly provide them outside pip.
-- `onnxscript` is part of the export dependency set because newer PyTorch ONNX export flows require it.
+- `onnxscript` is part of the export dependency set because the dynamo ONNX exporter requires it.
 - `all` is available as an aggregate extra for package-managed optional dependencies.
-- The CLIP tokenizer dependency is currently distributed as a VCS install, so it is listed in `requirements.txt` and `requirements-dev.txt` and shown explicitly above for git and PyPI installs.
+- The CLIP tokenizer dependency is distributed as a VCS install, so it is listed in `requirements.txt` and `requirements-dev.txt` and shown explicitly above for git and published-package installs.
 - The native extension builds by default during installation. For docs-only or unsupported environments, you can skip it with:
 
 ```bash
@@ -117,7 +119,7 @@ yoloe-train yoloe-26s-seg.pt data.yaml \
 See [Training](docs/training.md) for dataset format, output layout, Jetson guidance, and the full export-to-runtime
 workflow.
 
-On newer PyTorch builds, the default ONNX exporter mode is `auto`: it tries the newer dynamo exporter first and falls back to the legacy exporter if YOLOE tracing is incompatible. To force the stable legacy path explicitly:
+The default ONNX exporter mode is `auto`: it tries the dynamo exporter first and falls back to the legacy exporter if YOLOE tracing is incompatible. To force the legacy path explicitly:
 
 ```bash
 yoloe-export yoloe-26s-seg.pt --artifact-dir outputs/artifacts/yoloe26s --exporter legacy
@@ -186,7 +188,7 @@ Launch the GUI against an RTSP stream:
 yoloe-camera-gui --source rtsp://user:pass@camera.local:554/stream
 ```
 
-Repo-local convenience launcher:
+Repo-local launcher:
 
 ```bash
 scripts/launch_camera_gui.sh
@@ -221,8 +223,8 @@ GitHub Actions is the supported automation path for this repository.
 
 - The default example checkpoint `yoloe-26s-seg.pt` is resolved on demand and cached under `~/.cache/yoloe-tensorrt/assets/` unless `YOLOE_TRT_CACHE_DIR` is set.
 - Exported bundles and test artifacts belong under `outputs/`.
-- When a YOLOE text encoder asset such as `mobileclip2_b.ts` is missing locally, the package now attempts to download it into the package cache automatically before falling back.
-- You can still override the auto-resolved path with `YOLOE_TRT_TEXT_ENCODER` or `text_encoder=...`.
+- When a YOLOE text encoder asset such as `mobileclip2_b.ts` is missing locally, the package attempts to download it into the package cache automatically before falling back.
+- Override the auto-resolved path with `YOLOE_TRT_TEXT_ENCODER` or `text_encoder=...`.
 - If the TorchScript asset cannot be found or downloaded, the runtime falls back to Apple MobileCLIP `b` for prompt compilation. That preserves functionality but can increase prompt-update latency.
 
 ## Runtime Notes
@@ -230,12 +232,12 @@ GitHub Actions is the supported automation path for this repository.
 - The main inference engine path is native C++/TensorRT.
 - Host-image preprocessing uses native CUDA kernels when the native runtime is built.
 - Main-engine decode, NMS, box rescale, and segmentation mask reconstruction run in the native backend.
-- Visual-prompt TensorRT execution can run through the native backend, with Python still orchestrating prompt setup.
-- Prompt compilation and Ultralytics `Results` wrapping still live in Python.
-- Tracking is stateful and currently runs in Python on top of the detection/segmentation results.
+- Visual-prompt TensorRT execution can use the native backend, with Python orchestrating prompt setup.
+- Prompt compilation and Ultralytics `Results` wrapping live in Python.
+- Tracking is stateful and runs in Python on top of the detection/segmentation results.
 - `predict(...)` and `track(...)` choose the fastest supported internal path for the input representation they are given.
 - The prepared-tensor fast path is reached by passing the object returned from `prepare_cuda_input(...)` or by using `input_hint="prepared"`.
-- Plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors are still accepted without requiring manual preprocessing.
+- The API accepts plain file paths, PIL images, NumPy arrays, CPU tensors, and CUDA tensors without requiring manual preprocessing.
 - For production deployments, prefer `YOLOEEngine.from_engine(...)` and prebuilt bundles over `from_pt(...)`.
 - Live camera sources can use a Jetson zero-copy NVMM/EGL/CUDA ingest path when the native camera backend is built and the source negotiates an NVMM pipeline.
 - `camera_source_from_spec(..., target_imgsz=..., zero_copy=None|True|False)` controls that camera ingest policy. `None` auto-selects zero-copy when available, `True` requires it, and `False` forces the fallback CPU appsink path.
@@ -261,15 +263,6 @@ GitHub Actions is the supported automation path for this repository.
 - [Camera GUI](docs/camera-gui.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Development](docs/development.md)
-
-## Status
-
-The project is usable today for Jetson-focused deployments, but it is still early-stage. Version 0.3.0 adds dataset
-validation, training and fine-tuning surfaces, and post-training TensorRT artifact export on top of the existing
-runtime, camera, GUI, and benchmark tooling.
-
-Remaining work is focused on deployment hardening, target-hardware benchmark baselines, workflow polish, and keeping
-GPU/Jetson validation available outside required public CI.
 
 ## License
 

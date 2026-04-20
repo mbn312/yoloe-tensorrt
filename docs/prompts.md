@@ -22,6 +22,6 @@ engine.set_visual_prompts(
 
 When the expected TorchScript text encoder asset such as `mobileclip2_b.ts` is missing locally, the package first tries to download it into the package cache automatically and then reuses it for future runs.
 
-You can still provide a specific local asset through `YOLOE_TRT_TEXT_ENCODER` or by including it in the artifact bundle.
+Provide a specific local asset through `YOLOE_TRT_TEXT_ENCODER` or by including it in the artifact bundle.
 
 If the TorchScript asset cannot be found or downloaded, the runtime falls back to Apple MobileCLIP `b` for prompt compilation. That keeps runtime labels working, but prompt updates may be slower.

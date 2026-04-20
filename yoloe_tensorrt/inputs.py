@@ -13,6 +13,7 @@ from ._inference_types import PreparedTensorInput, prepare_tensor_input
 from .gstreamer import camera_source_from_spec
 from .logging_utils import get_logger
 from .source import (
+    OriginalImageReference,
     SourceItem,
     SourceStream,
     _is_iterable_source,
@@ -42,7 +43,7 @@ def normalize_inference_source(
     default_prefix: str = "image",
     input_hint: str | None = None,
     cuda: bool | None = None,
-    original_image: SourceItem | object | None = None,
+    original_image: OriginalImageReference = None,
     path: str | None = None,
 ) -> list[InferenceSourceItem]:
     items = list(
@@ -68,7 +69,7 @@ def normalize_single_inference_source(
     default_prefix: str = "image",
     input_hint: str | None = None,
     cuda: bool | None = None,
-    original_image: SourceItem | object | None = None,
+    original_image: OriginalImageReference = None,
     path: str | None = None,
     multiple_error: str = "Expected a single inference source item",
 ) -> InferenceSourceItem:
@@ -100,7 +101,7 @@ def iter_inference_sources(
     input_hint: str | None = None,
     cuda: bool | None = None,
     allow_unbounded_live: bool = True,
-    original_image: SourceItem | object | None = None,
+    original_image: OriginalImageReference = None,
     path: str | None = None,
 ) -> Iterator[InferenceSourceItem]:
     hint = normalize_input_hint(input_hint)
@@ -164,7 +165,7 @@ def _iter_tensor_source(
     default_prefix: str,
     input_hint: InputHint,
     cuda: bool | None,
-    original_image: SourceItem | object | None,
+    original_image: OriginalImageReference,
     path: str | None,
 ) -> Iterator[InferenceSourceItem]:
     if tensor.ndim == 4 and int(tensor.shape[0]) > 1:
